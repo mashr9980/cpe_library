@@ -1,0 +1,7 @@
+__pycache__/
+exceptions/__pycache__/
+internal/__pycache__/
+internal/util/__pycache__/
+util/__pycache__/
+values/__pycache__/
+official-cpe-dictionary_v2.3.xml
