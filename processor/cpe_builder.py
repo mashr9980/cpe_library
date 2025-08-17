@@ -1,4 +1,4 @@
-# cpe_parser/cpe_builder.py
+# processor/cpe_builder.py
 from typing import Union
 from values.part import Part
 from values.logical_value import LogicalValue

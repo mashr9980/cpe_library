@@ -1,4 +1,4 @@
-# cpe_parser/cpe.py
+# processor/cpe.py
 import re
 from typing import Optional, List
 from processor.icpe import ICpe

@@ -1,4 +1,4 @@
-# cpe_parser/icpe.py
+# processor/icpe.py
 from abc import ABC, abstractmethod
 from values.part import Part
 

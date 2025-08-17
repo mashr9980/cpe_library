@@ -4,9 +4,13 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 import re
 import logging
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import random
 from pathlib import Path
+import asyncio
+
+from processor.azure_client import AzureOpenAI
+# from azure_client import AzureOpenAI
 
 try:
     from processor.cpe import Cpe
@@ -30,6 +34,10 @@ class CpeXmlToExcelConverter:
             'cpe': 'http://cpe.mitre.org/dictionary/2.0',
             'cpe-23': 'http://scap.nist.gov/schema/cpe-extension/2.3'
         }
+        self.azure_client = AzureOpenAI(
+            endpoint="https://ext-dev-software-kgraph-resource.cognitiveservices.azure.com/openai/deployments/o4-mini/chat/completions?api-version=2025-01-01-preview",
+            api_key="2MQMrPxchgTJK0yYpEgJL1uS6cnsyjG1LiEmrd6VDCizTzzHilGeJQQJ99BHACPV0roXJ3w3AAAAACOGRdDV"
+        )
     
     def parse_xml_file(self) -> List[Dict]:
         logger.info(f"Parsing XML file: {self.xml_file_path}")
@@ -55,7 +63,7 @@ class CpeXmlToExcelConverter:
         parsed_data = []
         for item in sampled_items:
             try:
-                cpe_data = self.parse_cpe_item(item)
+                cpe_data = asyncio.run(self.parse_cpe_item(item))
                 if cpe_data:
                     parsed_data.append(cpe_data)
             except Exception as e:
@@ -65,7 +73,7 @@ class CpeXmlToExcelConverter:
         logger.info(f"Successfully parsed {len(parsed_data)} CPE items")
         return parsed_data
     
-    def parse_cpe_item(self, cpe_item: ET.Element) -> Optional[Dict]:
+    async def parse_cpe_item(self, cpe_item: ET.Element) -> Optional[Dict]:
         try:
             cpe_22_uri = cpe_item.get('name', '')
             
@@ -89,14 +97,14 @@ class CpeXmlToExcelConverter:
             
             parsed_cpe = CpeParser.parse(cpe_string)
             
-            return self.extract_cpe_components(parsed_cpe, title, references, cpe_string)
+            return await self.extract_cpe_components(parsed_cpe, title, references, cpe_string)
             
         except CpeParsingException:
             return None
         except Exception:
             return None
     
-    def extract_cpe_components(self, cpe: Cpe, title: str, references: List[str], cpe_string: str) -> Dict:
+    async def extract_cpe_components(self, cpe: Cpe, title: str, references: List[str], cpe_string: str) -> Dict:
         vendor_machine = cpe.get_vendor()
         product_machine = cpe.get_product()
         version = cpe.get_version()
@@ -107,8 +115,7 @@ class CpeXmlToExcelConverter:
         target_hw = cpe.get_target_hw()
         part = cpe.get_part()
         
-        vendor_human = self.generate_human_readable_name(vendor_machine)
-        product_human = self.generate_human_readable_name(product_machine)
+        vendor_human, product_human = await self.extract_names_from_title_intelligent(title, vendor_machine, product_machine)
         
         validation_result = self.validate_extracted_data(
             vendor_human, vendor_machine, product_human, product_machine, 
@@ -134,6 +141,225 @@ class CpeXmlToExcelConverter:
             'category': category
         }
     
+    async def extract_names_from_title_intelligent(self, title: str, vendor_machine: str, product_machine: str) -> Tuple[str, str]:
+        if not title or title in ['*', '-']:
+            return vendor_machine, product_machine
+        
+        title_analysis = self.analyze_title_structure(title)
+        
+        if title_analysis['single_entity']:
+            vendor_human = await self.extract_single_entity_vendor(title, vendor_machine, product_machine)
+            product_human = await self.extract_single_entity_product(title, vendor_machine, product_machine, vendor_human)
+        else:
+            vendor_human = await self.extract_multi_entity_vendor(title, vendor_machine, title_analysis)
+            product_human = await self.extract_multi_entity_product(title, product_machine, vendor_human, title_analysis)
+        
+        vendor_human, product_human = self.ensure_different_names(vendor_human, product_human, title, vendor_machine, product_machine)
+        
+        return vendor_human, product_human
+    
+    def analyze_title_structure(self, title: str) -> Dict:
+        words = title.split()
+        
+        company_indicators = ['Corp', 'Corporation', 'Inc', 'LLC', 'Ltd', 'Limited', 'AG', 'GmbH', 'Software', 'Foundation', 'Project', 'Systems', 'Technologies', 'Tech', 'Labs', 'Studio', 'Studios', 'Group', 'Team', 'Company']
+        
+        has_company_indicator = any(indicator in words for indicator in company_indicators)
+        
+        known_single_entities = ['OpenSSL', 'MySQL', 'PostgreSQL', 'MongoDB', 'Redis', 'Nginx', 'Apache', 'PHP', 'Python', 'Ruby', 'Node', 'jQuery', 'Vue', 'React', 'Angular']
+        
+        is_single_entity = any(entity.lower() in title.lower() for entity in known_single_entities)
+        
+        single_word_title = len([w for w in words if not re.match(r'\d+[\.\d]*', w)]) <= 2
+        
+        return {
+            'single_entity': is_single_entity or (single_word_title and not has_company_indicator),
+            'has_company_indicator': has_company_indicator,
+            'word_count': len(words),
+            'company_indicators': company_indicators
+        }
+    
+    async def extract_single_entity_vendor(self, title: str, vendor_machine: str, product_machine: str) -> str:
+        if vendor_machine == product_machine:
+            first_word = title.split()[0] if title.split() else vendor_machine
+            
+            version_removed = re.sub(r'\s+\d+[\.\d]*.*$', '', first_word)
+            return self.preserve_case_from_title(version_removed, title)
+        
+        return await self.extract_vendor_with_ai(title, vendor_machine)
+    
+    async def extract_single_entity_product(self, title: str, vendor_machine: str, product_machine: str, vendor_human: str) -> str:
+        if vendor_machine == product_machine:
+            first_part = title.split()[0] if title.split() else product_machine
+            version_removed = re.sub(r'\s+\d+[\.\d]*.*$', '', first_part)
+            return self.preserve_case_from_title(version_removed, title)
+        
+        title_without_vendor = title.replace(vendor_human, "").strip()
+        return await self.extract_product_with_ai(title_without_vendor if title_without_vendor else title, product_machine)
+    
+    async def extract_multi_entity_vendor(self, title: str, vendor_machine: str, title_analysis: Dict) -> str:
+        words = title.split()
+        
+        for i, word in enumerate(words):
+            if word in title_analysis['company_indicators'] and i > 0:
+                vendor_candidate = ' '.join(words[:i+1])
+                if self.matches_machine_name(vendor_candidate, vendor_machine):
+                    return self.preserve_case_from_title(vendor_candidate, title)
+        
+        return await self.extract_vendor_with_ai(title, vendor_machine)
+    
+    async def extract_multi_entity_product(self, title: str, product_machine: str, vendor_human: str, title_analysis: Dict) -> str:
+        title_without_vendor = title.replace(vendor_human, "").strip()
+        
+        if not title_without_vendor:
+            return await self.extract_product_with_ai(title, product_machine)
+        
+        product_candidate = self.extract_product_from_remaining_title(title_without_vendor)
+        
+        if self.matches_machine_name(product_candidate, product_machine):
+            return self.preserve_case_from_title(product_candidate, title)
+        
+        return await self.extract_product_with_ai(title_without_vendor, product_machine)
+    
+    def extract_product_from_remaining_title(self, remaining_title: str) -> str:
+        words = remaining_title.strip().split()
+        
+        stop_patterns = [r'\d+[\.\d]*', r'for\s+\w+', r'version\s*\d+', r'v\d+', r'beta', r'alpha', r'release', r'candidate', r'build']
+        
+        for i, word in enumerate(words):
+            if any(re.search(pattern, word.lower()) for pattern in stop_patterns):
+                if i > 0:
+                    return ' '.join(words[:i])
+                break
+        
+        max_words = min(len(words), 4)
+        return ' '.join(words[:max_words])
+    
+    async def extract_vendor_with_ai(self, title: str, vendor_machine: str) -> str:
+        prompt = f"""Extract the exact vendor/company name from this title, preserving original case and spacing:
+
+Title: "{title}"
+Machine reference: "{vendor_machine}"
+
+Rules:
+1. Extract ONLY the company/vendor name as it appears
+2. Preserve exact case (IBM stays IBM, not Ibm)
+3. Include company suffixes (LLC, Inc, Corp, etc.) if present
+4. Do not include product names
+5. Return only the vendor name, nothing else
+
+Vendor name:"""
+
+        try:
+            response = await self.azure_client.chat.completions.create(
+                model="o4-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=30
+            )
+            
+            result = response.choices[0].message.content.strip()
+            
+            if result and len(result.split()) <= 4 and any(word.lower() in title.lower() for word in result.split()):
+                return result
+                
+        except Exception as e:
+            logger.warning(f"Azure OpenAI vendor extraction failed: {e}")
+        
+        return self.generate_human_readable_name(vendor_machine)
+    
+    async def extract_product_with_ai(self, title: str, product_machine: str) -> str:
+        prompt = f"""Extract the exact product name from this title, preserving original case:
+
+Title: "{title}"
+Machine reference: "{product_machine}"
+
+Rules:
+1. Extract ONLY the product name as it appears
+2. Preserve exact case and formatting
+3. Remove version numbers and build info
+4. Remove platform suffixes (for WordPress, for Android, etc.)
+5. Return only the product name, nothing else
+
+Product name:"""
+
+        try:
+            response = await self.azure_client.chat.completions.create(
+                model="o4-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50
+            )
+            
+            result = response.choices[0].message.content.strip()
+            
+            if result:
+                cleaned = self.clean_product_name(result, title)
+                if cleaned and any(word.lower() in title.lower() for word in cleaned.split()):
+                    return cleaned
+                    
+        except Exception as e:
+            logger.warning(f"Azure OpenAI product extraction failed: {e}")
+        
+        return self.generate_human_readable_name(product_machine)
+    
+    def matches_machine_name(self, candidate: str, machine_name: str) -> bool:
+        candidate_clean = re.sub(r'[^a-zA-Z0-9]', '', candidate.lower())
+        machine_clean = re.sub(r'[^a-zA-Z0-9]', '', machine_name.lower())
+        
+        return (candidate_clean == machine_clean or 
+                candidate_clean in machine_clean or 
+                machine_clean in candidate_clean)
+    
+    def preserve_case_from_title(self, text: str, title: str) -> str:
+        text_lower = text.lower()
+        title_lower = title.lower()
+        
+        start_index = title_lower.find(text_lower)
+        if start_index != -1:
+            return title[start_index:start_index + len(text)]
+        
+        return text
+    
+    def ensure_different_names(self, vendor_human: str, product_human: str, title: str, vendor_machine: str, product_machine: str) -> Tuple[str, str]:
+        if vendor_human == product_human:
+            if vendor_machine != product_machine:
+                vendor_human = self.generate_human_readable_name(vendor_machine)
+                product_human = self.generate_human_readable_name(product_machine)
+            else:
+                words = title.split()
+                if len(words) >= 2:
+                    vendor_human = words[0]
+                    product_human = ' '.join(words[1:3]) if len(words) > 2 else words[1]
+                    
+                    product_human = re.sub(r'\s+\d+[\.\d]*.*$', '', product_human).strip()
+                else:
+                    product_human = f"{vendor_human} Software"
+        
+        return vendor_human, product_human
+    
+    def clean_product_name(self, product_name: str, title: str) -> str:
+        version_patterns = [
+            r'\s+\d+[\.\d]*.*$',
+            r'\s+v\d+.*$',
+            r'\s+\d{4}-\d{2}-\d{2}.*$',
+            r'\s+[Bb]eta.*$',
+            r'\s+[Rr]elease.*$',
+            r'\s+[Bb]uild.*$',
+            r'\s+[Aa]lpha.*$'
+        ]
+        
+        cleaned = product_name
+        for pattern in version_patterns:
+            cleaned = re.sub(pattern, '', cleaned)
+        
+        platform_patterns = [
+            r'\s+for\s+\w+.*$',
+            r'\s+on\s+\w+.*$'
+        ]
+        
+        for pattern in platform_patterns:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+        
+        return cleaned.strip()
+    
     def generate_human_readable_name(self, machine_name: str) -> str:
         if machine_name in ['*', '-']:
             return machine_name
@@ -143,69 +369,17 @@ class CpeXmlToExcelConverter:
         words = human_name.split()
         capitalized_words = []
         
+        acronyms = ['IBM', 'API', 'SDK', 'IDE', 'CLI', 'GUI', 'CPU', 'GPU', 'RAM', 'SSD', 'HDD', 'USB', 'HTTP', 'HTTPS', 'FTP', 'SSH', 'VPN', 'DNS', 'URL', 'XML', 'JSON', 'HTML', 'CSS', 'JS', 'PHP', 'SQL']
+        
         for word in words:
-            if re.match(r'^[A-Z]{2,}$', word):
-                capitalized_words.append(word)
+            if word.upper() in acronyms:
+                capitalized_words.append(word.upper())
             elif re.match(r'^v?\d+(\.\d+)*', word):
                 capitalized_words.append(word)
             else:
                 capitalized_words.append(word.capitalize())
         
         return ' '.join(capitalized_words)
-    
-    def normalize_for_comparison(self, text: str) -> str:
-        if not text or text in ['*', '-']:
-            return text
-        
-        normalized = re.sub(r'[^a-zA-Z0-9]', '', text.lower())
-        return normalized
-    
-    def extract_key_words(self, text: str) -> set:
-        if not text or text in ['*', '-']:
-            return set()
-        
-        words = re.findall(r'[a-zA-Z0-9]+', text.lower())
-        return {word for word in words if len(word) > 2}
-    
-    def split_camel_case(self, text: str) -> list:
-        """Split camelCase or PascalCase words"""
-        if not text:
-            return []
-        
-        words = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)|[0-9]+', text)
-        return [word.lower() for word in words if len(word) > 1]
-    
-    def get_word_variations(self, text: str) -> set:
-        """Get various word forms from text"""
-        if not text or text in ['*', '-']:
-            return set()
-        
-        variations = set()
-        
-        # Original words
-        words = re.findall(r'[a-zA-Z0-9]+', text.lower())
-        variations.update(word for word in words if len(word) > 2)
-        
-        # Split camelCase
-        camel_words = self.split_camel_case(text)
-        variations.update(word for word in camel_words if len(word) > 2)
-        
-        # Handle common abbreviations and expansions
-        text_lower = text.lower()
-        if 'cms' in text_lower:
-            variations.update(['cms', 'management', 'system'])
-        if 'wp' in text_lower:
-            variations.update(['wp', 'wordpress'])
-        if 'foundation' in text_lower:
-            variations.add('foundation')
-        if 'software' in text_lower:
-            variations.add('software')
-        if 'group' in text_lower:
-            variations.add('group')
-        if 'tech' in text_lower:
-            variations.update(['tech', 'technology'])
-        
-        return variations
     
     def validate_extracted_data(self, vendor_human: str, vendor_machine: str, 
                               product_human: str, product_machine: str,
@@ -217,72 +391,25 @@ class CpeXmlToExcelConverter:
             if any(x in ['*', '-'] for x in [vendor_human, vendor_machine, product_human, product_machine]):
                 return False
             
-            vendor_human_norm = self.normalize_for_comparison(vendor_human)
-            vendor_machine_norm = self.normalize_for_comparison(vendor_machine)
-            product_human_norm = self.normalize_for_comparison(product_human)
-            product_machine_norm = self.normalize_for_comparison(product_machine)
-            
-            if not vendor_human_norm or not vendor_machine_norm:
-                return False
-            if not product_human_norm or not product_machine_norm:
+            if vendor_human.strip() == product_human.strip():
                 return False
             
-            # Relaxed start/end character matching - allow some flexibility
-            vendor_start_match = (vendor_human_norm[0] == vendor_machine_norm[0] or 
-                                abs(ord(vendor_human_norm[0]) - ord(vendor_machine_norm[0])) <= 2)
-            vendor_end_match = (vendor_human_norm[-1] == vendor_machine_norm[-1] or
-                               abs(ord(vendor_human_norm[-1]) - ord(vendor_machine_norm[-1])) <= 2)
-            product_start_match = (product_human_norm[0] == product_machine_norm[0] or
-                                 abs(ord(product_human_norm[0]) - ord(product_machine_norm[0])) <= 2)
-            product_end_match = (product_human_norm[-1] == product_machine_norm[-1] or
-                                abs(ord(product_human_norm[-1]) - ord(product_machine_norm[-1])) <= 2)
+            title_lower = title.lower()
+            vendor_lower = vendor_human.lower()
+            product_lower = product_human.lower()
             
-            if not (vendor_start_match and vendor_end_match):
-                return False
-            if not (product_start_match and product_end_match):
-                return False
+            vendor_in_title = vendor_lower in title_lower
+            product_in_title = product_lower in title_lower
             
-            title_variations = self.get_word_variations(title)
-            vendor_variations = self.get_word_variations(vendor_human)
-            product_variations = self.get_word_variations(product_human)
+            if not vendor_in_title:
+                vendor_words = vendor_lower.split()
+                vendor_in_title = any(word in title_lower for word in vendor_words if len(word) > 2)
             
-            # Check vendor match
-            vendor_match = False
-            if vendor_variations:
-                vendor_overlap = len(vendor_variations.intersection(title_variations))
-                vendor_match = vendor_overlap > 0
-                
-                # Additional check for partial matches
-                if not vendor_match:
-                    for vendor_word in vendor_variations:
-                        for title_word in title_variations:
-                            if (vendor_word in title_word or title_word in vendor_word) and len(vendor_word) > 3:
-                                vendor_match = True
-                                break
-                        if vendor_match:
-                            break
-            else:
-                vendor_match = True
+            if not product_in_title:
+                product_words = product_lower.split()
+                product_in_title = any(word in title_lower for word in product_words if len(word) > 2)
             
-            # Check product match
-            product_match = False
-            if product_variations:
-                product_overlap = len(product_variations.intersection(title_variations))
-                product_match = product_overlap > 0
-                
-                # Additional check for partial matches
-                if not product_match:
-                    for product_word in product_variations:
-                        for title_word in title_variations:
-                            if (product_word in title_word or title_word in product_word) and len(product_word) > 3:
-                                product_match = True
-                                break
-                        if product_match:
-                            break
-            else:
-                product_match = True
-            
-            return vendor_match and product_match
+            return vendor_in_title and product_in_title
             
         except (IndexError, AttributeError):
             return False
@@ -339,7 +466,7 @@ class CpeXmlToExcelConverter:
 
 def main():
     XML_FILE_PATH = "official-cpe-dictionary_v2.3.xml"
-    SAMPLE_PERCENTAGE = 0.0001
+    SAMPLE_PERCENTAGE = 0.00011
     OUTPUT_FILE = f"output/cpe_extracted_data_{SAMPLE_PERCENTAGE}.xlsx"
     
     try:
