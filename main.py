@@ -1,577 +1,366 @@
+#!/usr/bin/env python3
+
 import xml.etree.ElementTree as ET
 import pandas as pd
-import os
-import sys
+import re
+import logging
 from typing import List, Dict, Optional
-from cpe_parser import CpeParser, CpeParsingException
-from test import test_cpe_parser
+import random
+from pathlib import Path
 
-class CPEXMLProcessor:
+try:
+    from processor.cpe import Cpe
+    from processor.cpe_parser import CpeParser
+    from values.part import Part
+    from values.logical_value import LogicalValue
+    from exceptions import CpeParsingException
+except ImportError as e:
+    print(f"Error importing CPE parser modules: {e}")
+    raise
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class CpeXmlToExcelConverter:
+    
     def __init__(self, xml_file_path: str, sample_percentage: float = 0.01):
-        """
-        Initialize the CPE XML processor
-        
-        Args:
-            xml_file_path: Path to the official-cpe-dictionary_v2.3.xml file
-            sample_percentage: Percentage of data to process (0.01 = 1%, 1.0 = 100%)
-        """
         self.xml_file_path = xml_file_path
         self.sample_percentage = sample_percentage
         self.namespaces = {
             'cpe': 'http://cpe.mitre.org/dictionary/2.0',
             'cpe-23': 'http://scap.nist.gov/schema/cpe-extension/2.3'
         }
+    
+    def parse_xml_file(self) -> List[Dict]:
+        logger.info(f"Parsing XML file: {self.xml_file_path}")
         
-    def parse_xml_to_dataframe(self) -> pd.DataFrame:
-        """
-        Parse the XML file and convert to a pandas DataFrame
-        
-        Returns:
-            DataFrame with CPE data
-        """
-        print(f"📁 Processing XML file: {self.xml_file_path}")
-        print(f"📊 Sample percentage: {self.sample_percentage * 100:.2f}%")
-        
-        # Parse XML file
         try:
             tree = ET.parse(self.xml_file_path)
             root = tree.getroot()
-        except Exception as e:
-            print(f"❌ Error parsing XML file: {e}")
-            sys.exit(1)
+        except ET.ParseError as e:
+            logger.error(f"Failed to parse XML file: {e}")
+            raise
+        except FileNotFoundError:
+            logger.error(f"XML file not found: {self.xml_file_path}")
+            raise
         
-        # Find all CPE items
         cpe_items = root.findall('.//cpe:cpe-item', self.namespaces)
         total_items = len(cpe_items)
         
-        print(f"📝 Total CPE items found: {total_items:,}")
-        
-        # Calculate sample size
         sample_size = max(1, int(total_items * self.sample_percentage))
-        print(f"🎯 Processing {sample_size:,} items ({self.sample_percentage * 100:.2f}%)")
+        logger.info(f"Found {total_items} CPE items, sampling {sample_size} items ({self.sample_percentage*100:.2f}%)")
         
-        # Take sample
-        sample_items = cpe_items[:sample_size]
+        sampled_items = random.sample(cpe_items, sample_size)
         
-        # Process items
-        processed_data = []
-        for i, item in enumerate(sample_items):
+        parsed_data = []
+        for item in sampled_items:
             try:
-                cpe_data = self._process_cpe_item(item)
+                cpe_data = self.parse_cpe_item(item)
                 if cpe_data:
-                    processed_data.append(cpe_data)
-                
-                # Progress indicator
-                if (i + 1) % 1000 == 0 or i == len(sample_items) - 1:
-                    print(f"⏳ Processed {i + 1:,}/{len(sample_items):,} items...")
-                    
+                    parsed_data.append(cpe_data)
             except Exception as e:
-                print(f"⚠️  Error processing item {i}: {e}")
+                logger.warning(f"Failed to parse CPE item: {e}")
                 continue
         
-        print(f"✅ Successfully processed {len(processed_data):,} items")
-        
-        # Create DataFrame
-        df = pd.DataFrame(processed_data)
-        return df
+        logger.info(f"Successfully parsed {len(parsed_data)} CPE items")
+        return parsed_data
     
-    def _process_cpe_item(self, item) -> Optional[Dict]:
-        """
-        Process a single CPE item and extract relevant data
-        
-        Args:
-            item: XML element representing a CPE item
-            
-        Returns:
-            Dictionary with CPE data or None if processing fails
-        """
+    def parse_cpe_item(self, cpe_item: ET.Element) -> Optional[Dict]:
         try:
-            # Get CPE names
-            cpe_22_name = item.get('name', '')
-            cpe_23_element = item.find('.//cpe-23:cpe23-item', self.namespaces)
-            cpe_23_name = cpe_23_element.get('name', '') if cpe_23_element is not None else ''
+            cpe_22_uri = cpe_item.get('name', '')
             
-            # Use CPE 2.3 format as primary, fallback to 2.2
-            primary_cpe = cpe_23_name or cpe_22_name
+            cpe_23_element = cpe_item.find('.//cpe-23:cpe23-item', self.namespaces)
+            cpe_23_fs = cpe_23_element.get('name', '') if cpe_23_element is not None else ''
             
-            # Get title
-            title_element = item.find('.//cpe:title', self.namespaces)
-            original_title = title_element.text if title_element is not None else ''
+            title_element = cpe_item.find('.//cpe:title', self.namespaces)
+            title = title_element.text if title_element is not None else ''
             
-            # Get references as array
             references = []
-            reference_elements = item.findall('.//cpe:reference', self.namespaces)
-            for ref in reference_elements:
+            ref_elements = cpe_item.findall('.//cpe:reference', self.namespaces)
+            for ref in ref_elements:
                 href = ref.get('href', '')
                 if href:
                     references.append(href)
             
-            # Parse CPE using our parser
-            cpe_data = self._parse_cpe_with_parser(primary_cpe)
+            cpe_string = cpe_23_fs if cpe_23_fs else cpe_22_uri
             
-            # Get machine values (raw from CPE)
-            vendor_machine = cpe_data.get('vendor', '')
-            product_machine = cpe_data.get('product', '')
+            if not cpe_string:
+                return None
             
-            # Extract clean vendor/product names with technical validation
-            vendor_human = self._clean_name_with_validation(vendor_machine, 'vendor')
-            product_human = self._clean_name_with_validation(product_machine, 'product')
+            parsed_cpe = CpeParser.parse(cpe_string)
             
-            # Technical validation
-            validation_result = self._perform_technical_validation(
-                vendor_human, vendor_machine,
-                product_human, product_machine,
-                cpe_data.get('version', '*'),
-                cpe_data.get('target_sw', '*'),
-                original_title
-            )
+            return self.extract_cpe_components(parsed_cpe, title, references, cpe_string)
             
-            # Determine category based on part and other attributes
-            category = self._determine_category(cpe_data, original_title)
-            
-            # Combine all data in the reference format
-            result = {
-                'cpe': primary_cpe,
-                'Title': original_title,
-                'vendor_human': vendor_human,
-                'product_human': product_human,
-                'vendor_machine': vendor_machine,  # Keep for validation
-                'product_machine': product_machine,  # Keep for validation
-                'Validation Product Name': validation_result['validation_passed'],
-                'part': cpe_data.get('part', ''),
-                'target_softwares': [cpe_data.get('target_sw', '*')] if cpe_data.get('target_sw') != '*' else ['*'],
-                'target_hardwares': [cpe_data.get('target_hw', '*')] if cpe_data.get('target_hw') != '*' else ['*'],
-                'versions': [cpe_data.get('version', '*')] if cpe_data.get('version') != '*' else ['*'],
-                'updates': [cpe_data.get('update', '*')] if cpe_data.get('update') != '*' else ['*'],
-                'editions': [cpe_data.get('edition', '*')] if cpe_data.get('edition') != '*' else ['*'],
-                'languages': [cpe_data.get('language', '*')] if cpe_data.get('language') != '*' else ['*'],
-                'references': references,
-                'category': category,
-                'validation_details': validation_result['details'],
-                'constructed_title': validation_result['constructed_title']
-            }
-            
-            return result
-            
-        except Exception as e:
-            print(f"Error processing CPE item: {e}")
+        except CpeParsingException:
+            return None
+        except Exception:
             return None
     
-    def _parse_cpe_with_parser(self, cpe_string: str) -> Dict:
-        """
-        Parse CPE string using our CPE parser and extract components
+    def extract_cpe_components(self, cpe: Cpe, title: str, references: List[str], cpe_string: str) -> Dict:
+        vendor_machine = cpe.get_vendor()
+        product_machine = cpe.get_product()
+        version = cpe.get_version()
+        update = cpe.get_update()
+        edition = cpe.get_edition()
+        language = cpe.get_language()
+        target_sw = cpe.get_target_sw()
+        target_hw = cpe.get_target_hw()
+        part = cpe.get_part()
         
-        Args:
-            cpe_string: CPE string to parse
-            
-        Returns:
-            Dictionary with parsed CPE components
-        """
-        default_data = {
-            'part': '',
-            'vendor': '',
-            'product': '',
-            'version': '*',
-            'update': '*',
-            'edition': '*',
-            'language': '*',
-            'sw_edition': '*',
-            'target_sw': '*',
-            'target_hw': '*',
-            'other': '*'
-        }
+        vendor_human = self.generate_human_readable_name(vendor_machine)
+        product_human = self.generate_human_readable_name(product_machine)
         
-        if not cpe_string:
-            return default_data
+        validation_result = self.validate_extracted_data(
+            vendor_human, vendor_machine, product_human, product_machine, 
+            version, target_sw, title
+        )
         
-        try:
-            # Parse using our CPE parser
-            cpe = CpeParser.parse(cpe_string)
-            
-            return {
-                'part': cpe.get_part().get_abbreviation(),
-                'vendor': cpe.get_vendor(),
-                'product': cpe.get_product(),
-                'version': cpe.get_version(),
-                'update': cpe.get_update(),
-                'edition': cpe.get_edition(),
-                'language': cpe.get_language(),
-                'sw_edition': cpe.get_sw_edition(),
-                'target_sw': cpe.get_target_sw(),
-                'target_hw': cpe.get_target_hw(),
-                'other': cpe.get_other()
-            }
-            
-        except CpeParsingException as e:
-            print(f"CPE parsing error for '{cpe_string}': {e}")
-            return default_data
-        except Exception as e:
-            print(f"Unexpected error parsing '{cpe_string}': {e}")
-            return default_data
-    
-    def _clean_name_with_validation(self, name: str, name_type: str) -> str:
-        """
-        Clean vendor/product names while maintaining validation compatibility
-        
-        Args:
-            name: Raw vendor or product name
-            name_type: 'vendor' or 'product' for context
-            
-        Returns:
-            Cleaned human-readable name that maintains start/end character validation
-        """
-        if not name or name in ['*', '-']:
-            return ''
-        
-        original_name = name
-        
-        # Remove common suffixes but keep start/end characters intact
-        suffixes_to_remove = [
-            '_project', '_team', '_inc', '_corp', '_corporation', 
-            '_ltd', '_llc', '_foundation', '_software', '_systems',
-            '_technologies', '_tech', '_group', '_company', '_co'
-        ]
-        
-        cleaned = name
-        for suffix in suffixes_to_remove:
-            if cleaned.lower().endswith(suffix):
-                cleaned = cleaned[:-len(suffix)]
-        
-        # Replace underscores and hyphens with spaces, but keep original start/end
-        cleaned = cleaned.replace('_', ' ').replace('-', ' ')
-        
-        # Handle special characters in names
-        cleaned = cleaned.replace('\\', '').replace('/', ' ')
-        
-        # Clean multiple spaces and trim
-        cleaned = ' '.join(cleaned.split())
-        
-        # Ensure we maintain the same start and end characters as original (validation requirement)
-        if cleaned and original_name:
-            # If cleaning changed start/end characters significantly, be more conservative
-            if (cleaned.lower()[0] != original_name.lower()[0] or 
-                cleaned.lower()[-1] != original_name.lower()[-1]):
-                # Try a more conservative approach
-                conservative_clean = original_name.replace('_', ' ').replace('-', ' ')
-                conservative_clean = ' '.join(conservative_clean.split())
-                if (conservative_clean.lower()[0] == original_name.lower()[0] and 
-                    conservative_clean.lower()[-1] == original_name.lower()[-1]):
-                    cleaned = conservative_clean
-                else:
-                    # Fall back to minimal cleaning
-                    cleaned = original_name.replace('_', ' ')
-        
-        # Title case for better readability
-        if cleaned:
-            cleaned = cleaned.title()
-            
-        return cleaned
-    
-    def _perform_technical_validation(self, vendor_human: str, vendor_machine: str,
-                                    product_human: str, product_machine: str,
-                                    version: str, target_sw: str, original_title: str) -> Dict:
-        """
-        Perform technical validation according to specified rules
-        
-        Args:
-            vendor_human: Human-readable vendor name
-            vendor_machine: Machine vendor name from CPE
-            product_human: Human-readable product name  
-            product_machine: Machine product name from CPE
-            version: Version from CPE
-            target_sw: Target software from CPE
-            original_title: Original title from XML
-            
-        Returns:
-            Dictionary with validation results
-        """
-        validation_details = []
-        validation_passed = True
-        
-        # Rule 1: Vendor_Human has to start with the same character as Vendor_Machine (lowercase)
-        if vendor_human and vendor_machine:
-            if vendor_human.lower()[0] != vendor_machine.lower()[0]:
-                validation_details.append(f"Vendor start char mismatch: '{vendor_human[0]}' vs '{vendor_machine[0]}'")
-                validation_passed = False
-            
-            # Rule 2: Vendor_Human has to end with the same character as Vendor_Machine (lowercase)
-            if vendor_human.lower()[-1] != vendor_machine.lower()[-1]:
-                validation_details.append(f"Vendor end char mismatch: '{vendor_human[-1]}' vs '{vendor_machine[-1]}'")
-                validation_passed = False
-        
-        # Rule 3: Product_Human has to start with the same character as Product_Machine (lowercase)
-        if product_human and product_machine:
-            if product_human.lower()[0] != product_machine.lower()[0]:
-                validation_details.append(f"Product start char mismatch: '{product_human[0]}' vs '{product_machine[0]}'")
-                validation_passed = False
-            
-            # Rule 4: Product_Human has to end with the same character as Product_Machine (lowercase)
-            if product_human.lower()[-1] != product_machine.lower()[-1]:
-                validation_details.append(f"Product end char mismatch: '{product_human[-1]}' vs '{product_machine[-1]}'")
-                validation_passed = False
-        
-        # Rule 5: Construct title and compare with original
-        constructed_title = self._construct_title(vendor_human, product_human, version, target_sw)
-        
-        # Normalize both titles for comparison (remove extra spaces, convert to lowercase)
-        normalized_original = ' '.join(original_title.lower().split())
-        normalized_constructed = ' '.join(constructed_title.lower().split())
-        
-        if normalized_constructed not in normalized_original:
-            validation_details.append(f"Title mismatch: constructed '{constructed_title}' not found in '{original_title}'")
-            validation_passed = False
+        category = self.get_category_from_part(part)
         
         return {
-            'validation_passed': validation_passed,
-            'details': ' | '.join(validation_details) if validation_details else 'All validations passed',
-            'constructed_title': constructed_title
+            'cpe': cpe_string,
+            'Title': title,
+            'vendor_human': vendor_human,
+            'product_human': product_human,
+            'Validation Product Name': validation_result,
+            'part': part.get_abbreviation(),
+            'target_softwares': [target_sw] if target_sw != '*' else ['*'],
+            'target_hardwares': [target_hw] if target_hw != '*' else ['*'],
+            'versions': [version] if version != '-' else ['-'],
+            'updates': [update] if update != '*' else ['*'],
+            'editions': [edition] if edition != '*' else ['*'],
+            'languages': [language] if language != '*' else ['*'],
+            'references': references,
+            'category': category
         }
     
-    def _construct_title(self, vendor_human: str, product_human: str, version: str, target_sw: str) -> str:
-        """
-        Construct title according to the rule:
-        Vendor_Human + space + Product_Human + space + Version (except if "-") + space + "for" + space + Target_Software
+    def generate_human_readable_name(self, machine_name: str) -> str:
+        if machine_name in ['*', '-']:
+            return machine_name
         
-        Args:
-            vendor_human: Human-readable vendor name
-            product_human: Human-readable product name
-            version: Version (skip if "-")
-            target_sw: Target software
-            
-        Returns:
-            Constructed title string
-        """
-        parts = []
+        human_name = machine_name.replace('_', ' ').replace('-', ' ')
         
-        # Add vendor if available
-        if vendor_human and vendor_human != '*':
-            parts.append(vendor_human)
+        words = human_name.split()
+        capitalized_words = []
         
-        # Add product if available
-        if product_human and product_human != '*':
-            parts.append(product_human)
-        
-        # Add version if not "-" or "*"
-        if version and version not in ['-', '*']:
-            parts.append(version)
-        
-        # Add "for" + target software if target_sw is not "*"
-        if target_sw and target_sw != '*':
-            parts.extend(['for', target_sw])
-        
-        return ' '.join(parts)
-    
-    def _determine_category(self, cpe_data: Dict, title: str) -> str:
-        """
-        Determine the category based on CPE data and title
-        
-        Args:
-            cpe_data: Parsed CPE data
-            title: CPE title
-            
-        Returns:
-            Category string
-        """
-        part = cpe_data.get('part', '').lower()
-        target_sw = cpe_data.get('target_sw', '').lower()
-        product = cpe_data.get('product', '').lower()
-        title_lower = title.lower()
-        
-        # Determine category based on various factors
-        if part == 'a':  # Application
-            if any(term in target_sw for term in ['android', 'ios']):
-                return 'Mobile Application'
-            elif any(term in target_sw for term in ['node.js', 'nodejs']):
-                return 'Node.js Package'
-            elif any(term in target_sw for term in ['wordpress', 'drupal', 'joomla']):
-                return 'CMS Plugin'
-            elif any(term in title_lower for term in ['firmware', 'bios']):
-                return 'Firmware'
+        for word in words:
+            if re.match(r'^[A-Z]{2,}$', word):
+                capitalized_words.append(word)
+            elif re.match(r'^v?\d+(\.\d+)*', word):
+                capitalized_words.append(word)
             else:
-                return 'Application'
-        elif part == 'o':  # Operating System
-            if any(term in product for term in ['firmware', 'bios']):
-                return 'Firmware'
-            else:
-                return 'Operating System'
-        elif part == 'h':  # Hardware
-            return 'Hardware'
-        else:
-            return 'Unknown'
+                capitalized_words.append(word.capitalize())
+        
+        return ' '.join(capitalized_words)
     
-    def save_to_excel(self, df: pd.DataFrame, output_file: str = "cpe_data.xlsx"):
-        """
-        Save DataFrame to Excel file
+    def normalize_for_comparison(self, text: str) -> str:
+        if not text or text in ['*', '-']:
+            return text
         
-        Args:
-            df: DataFrame to save
-            output_file: Output Excel file path
-        """
-        print(f"💾 Saving data to Excel file: {output_file}")
+        normalized = re.sub(r'[^a-zA-Z0-9]', '', text.lower())
+        return normalized
+    
+    def extract_key_words(self, text: str) -> set:
+        if not text or text in ['*', '-']:
+            return set()
         
+        words = re.findall(r'[a-zA-Z0-9]+', text.lower())
+        return {word for word in words if len(word) > 2}
+    
+    def split_camel_case(self, text: str) -> list:
+        """Split camelCase or PascalCase words"""
+        if not text:
+            return []
+        
+        words = re.findall(r'[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\b)|[0-9]+', text)
+        return [word.lower() for word in words if len(word) > 1]
+    
+    def get_word_variations(self, text: str) -> set:
+        """Get various word forms from text"""
+        if not text or text in ['*', '-']:
+            return set()
+        
+        variations = set()
+        
+        # Original words
+        words = re.findall(r'[a-zA-Z0-9]+', text.lower())
+        variations.update(word for word in words if len(word) > 2)
+        
+        # Split camelCase
+        camel_words = self.split_camel_case(text)
+        variations.update(word for word in camel_words if len(word) > 2)
+        
+        # Handle common abbreviations and expansions
+        text_lower = text.lower()
+        if 'cms' in text_lower:
+            variations.update(['cms', 'management', 'system'])
+        if 'wp' in text_lower:
+            variations.update(['wp', 'wordpress'])
+        if 'foundation' in text_lower:
+            variations.add('foundation')
+        if 'software' in text_lower:
+            variations.add('software')
+        if 'group' in text_lower:
+            variations.add('group')
+        if 'tech' in text_lower:
+            variations.update(['tech', 'technology'])
+        
+        return variations
+    
+    def validate_extracted_data(self, vendor_human: str, vendor_machine: str, 
+                              product_human: str, product_machine: str,
+                              version: str, target_sw: str, title: str) -> bool:
         try:
-            # Define exact column order to match reference file
-            column_order = [
-                'cpe',
-                'Title',
-                'vendor_human',
-                'product_human',
-                'vendor_machine',  # Keep for reference/debugging
-                'product_machine',  # Keep for reference/debugging
-                'Validation Product Name',
-                'part',
-                'target_softwares',
-                'target_hardwares',
-                'versions',
-                'updates',
-                'editions',
-                'languages',
-                'references',
-                'category',
-                'validation_details',  # Technical validation results
-                'constructed_title'    # Constructed title for validation
-            ]
+            if not all([vendor_human, vendor_machine, product_human, product_machine]):
+                return False
             
-            # Ensure all required columns exist
-            for col in column_order:
-                if col not in df.columns:
-                    df[col] = ''
+            if any(x in ['*', '-'] for x in [vendor_human, vendor_machine, product_human, product_machine]):
+                return False
             
-            # Reorder columns to match reference
-            df_ordered = df[column_order]
+            vendor_human_norm = self.normalize_for_comparison(vendor_human)
+            vendor_machine_norm = self.normalize_for_comparison(vendor_machine)
+            product_human_norm = self.normalize_for_comparison(product_human)
+            product_machine_norm = self.normalize_for_comparison(product_machine)
             
-            # Convert array columns to string representation to match reference format
-            array_columns = ['target_softwares', 'target_hardwares', 'versions', 'updates', 'editions', 'languages', 'references']
-            for col in array_columns:
-                if col in df_ordered.columns:
-                    df_ordered[col] = df_ordered[col].apply(lambda x: str(x) if isinstance(x, list) else str([x]) if x else "['*']")
+            if not vendor_human_norm or not vendor_machine_norm:
+                return False
+            if not product_human_norm or not product_machine_norm:
+                return False
             
-            # Save to Excel with formatting matching reference
-            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-                df_ordered.to_excel(writer, sheet_name='Sheet1', index=False)
+            # Relaxed start/end character matching - allow some flexibility
+            vendor_start_match = (vendor_human_norm[0] == vendor_machine_norm[0] or 
+                                abs(ord(vendor_human_norm[0]) - ord(vendor_machine_norm[0])) <= 2)
+            vendor_end_match = (vendor_human_norm[-1] == vendor_machine_norm[-1] or
+                               abs(ord(vendor_human_norm[-1]) - ord(vendor_machine_norm[-1])) <= 2)
+            product_start_match = (product_human_norm[0] == product_machine_norm[0] or
+                                 abs(ord(product_human_norm[0]) - ord(product_machine_norm[0])) <= 2)
+            product_end_match = (product_human_norm[-1] == product_machine_norm[-1] or
+                                abs(ord(product_human_norm[-1]) - ord(product_machine_norm[-1])) <= 2)
+            
+            if not (vendor_start_match and vendor_end_match):
+                return False
+            if not (product_start_match and product_end_match):
+                return False
+            
+            title_variations = self.get_word_variations(title)
+            vendor_variations = self.get_word_variations(vendor_human)
+            product_variations = self.get_word_variations(product_human)
+            
+            # Check vendor match
+            vendor_match = False
+            if vendor_variations:
+                vendor_overlap = len(vendor_variations.intersection(title_variations))
+                vendor_match = vendor_overlap > 0
                 
-                # Get the workbook and worksheet
-                workbook = writer.book
-                worksheet = writer.sheets['Sheet1']
+                # Additional check for partial matches
+                if not vendor_match:
+                    for vendor_word in vendor_variations:
+                        for title_word in title_variations:
+                            if (vendor_word in title_word or title_word in vendor_word) and len(vendor_word) > 3:
+                                vendor_match = True
+                                break
+                        if vendor_match:
+                            break
+            else:
+                vendor_match = True
+            
+            # Check product match
+            product_match = False
+            if product_variations:
+                product_overlap = len(product_variations.intersection(title_variations))
+                product_match = product_overlap > 0
                 
-                # Auto-adjust column widths
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    
-                    adjusted_width = min(max_length + 2, 60)  # Increased cap for validation details
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
+                # Additional check for partial matches
+                if not product_match:
+                    for product_word in product_variations:
+                        for title_word in title_variations:
+                            if (product_word in title_word or title_word in product_word) and len(product_word) > 3:
+                                product_match = True
+                                break
+                        if product_match:
+                            break
+            else:
+                product_match = True
             
-            print(f"✅ Excel file saved successfully!")
-            print(f"📊 Total rows: {len(df):,}")
-            print(f"📋 Total columns: {len(df.columns)}")
+            return vendor_match and product_match
             
-        except Exception as e:
-            print(f"❌ Error saving Excel file: {e}")
+        except (IndexError, AttributeError):
+            return False
     
-    def process_and_save(self, output_file: str = "cpe_data.xlsx"):
-        """
-        Complete processing: parse XML and save to Excel
+    def get_category_from_part(self, part: Part) -> str:
+        if part == Part.APPLICATION:
+            return "Application"
+        elif part == Part.OPERATING_SYSTEM:
+            return "Operating System"
+        elif part == Part.HARDWARE_DEVICE:
+            return "Hardware"
+        else:
+            return "Unknown"
+    
+    def create_excel_file(self, data: List[Dict], output_file: str = "cpe_extracted_data.xlsx"):
+        logger.info(f"Creating Excel file: {output_file}")
         
-        Args:
-            output_file: Output Excel file path
-        """
-        print("🚀 Starting CPE XML to Excel conversion with technical validation...")
+        columns = [
+            'cpe', 'Title', 'vendor_human', 'product_human', 'Validation Product Name',
+            'part', 'target_softwares', 'target_hardwares', 'versions', 'updates',
+            'editions', 'languages', 'references', 'category', 'Unnamed: 12'
+        ]
         
-        # Check if XML file exists
-        if not os.path.exists(self.xml_file_path):
-            print(f"❌ XML file not found: {self.xml_file_path}")
-            print("Please ensure the official-cpe-dictionary_v2.3.xml file is in the current directory")
+        df = pd.DataFrame(data)
+        
+        df = df.reindex(columns=columns, fill_value='')
+        
+        df['Unnamed: 12'] = ''
+        
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Sheet1', index=False)
+        
+        logger.info(f"Excel file created successfully: {output_file}")
+        logger.info(f"Total records: {len(df)}")
+        logger.info(f"Validation passed: {df['Validation Product Name'].sum()}")
+        logger.info(f"Validation failed: {len(df) - df['Validation Product Name'].sum()}")
+    
+    def run(self, output_file: str = "cpe_extracted_data.xlsx"):
+        logger.info("Starting CPE XML to Excel conversion")
+        
+        if not Path(self.xml_file_path).exists():
+            logger.error(f"XML file not found: {self.xml_file_path}")
+            raise FileNotFoundError(f"XML file not found: {self.xml_file_path}")
+        
+        cpe_data = self.parse_xml_file()
+        
+        if not cpe_data:
+            logger.error("No valid CPE data found")
             return
         
-        # Parse XML to DataFrame
-        df = self.parse_xml_to_dataframe()
+        self.create_excel_file(cpe_data, output_file)
         
-        if df.empty:
-            print("❌ No data was processed successfully")
-            return
-        
-        # Save to Excel
-        self.save_to_excel(df, output_file)
-        
-        # Print summary statistics including validation
-        self._print_summary_stats(df)
-    
-    def _print_summary_stats(self, df: pd.DataFrame):
-        """Print summary statistics about the processed data"""
-        print("\n📈 Summary Statistics:")
-        print("=" * 50)
-        
-        total_items = len(df)
-        print(f"✅ Total items processed: {total_items:,}")
-        
-        # Technical validation statistics
-        if 'Validation Product Name' in df.columns:
-            validation_passed = df['Validation Product Name'].sum()
-            validation_rate = (validation_passed / total_items) * 100
-            print(f"🔍 Technical validation passed: {validation_passed:,}/{total_items:,} ({validation_rate:.1f}%)")
-            
-            # Show common validation issues
-            if 'validation_details' in df.columns:
-                failed_validations = df[df['Validation Product Name'] == False]
-                if len(failed_validations) > 0:
-                    print(f"\n⚠️  Common validation issues:")
-                    validation_issues = failed_validations['validation_details'].value_counts().head(5)
-                    for issue, count in validation_issues.items():
-                        if 'All validations passed' not in issue:
-                            print(f"   - {issue}: {count} cases")
-        
-        if 'part' in df.columns:
-            print(f"\n📊 CPE Parts distribution:")
-            part_counts = df['part'].value_counts()
-            for part, count in part_counts.items():
-                if part:
-                    part_name = {'a': 'Application', 'o': 'Operating System', 'h': 'Hardware'}.get(part, part)
-                    print(f"   {part_name} ({part}): {count:,}")
-        
-        if 'vendor_human' in df.columns:
-            unique_vendors = df['vendor_human'].nunique()
-            print(f"\n🏢 Unique vendors: {unique_vendors:,}")
-            
-            top_vendors = df['vendor_human'].value_counts().head(5)
-            print(f"   Top 5 vendors:")
-            for vendor, count in top_vendors.items():
-                if vendor and vendor != '*':
-                    print(f"   - {vendor}: {count}")
-        
-        if 'category' in df.columns:
-            print(f"\n📂 Categories:")
-            category_counts = df['category'].value_counts()
-            for category, count in category_counts.items():
-                print(f"   {category}: {count:,}")
-        
-        print("=" * 50)
+        logger.info("CPE XML to Excel conversion completed successfully")
 
 def main():
-    """Main function to run the CPE processing"""
-    print("🏃‍♂️ Running CPE Parser Tests...")
-    test_cpe_parser()
+    XML_FILE_PATH = "official-cpe-dictionary_v2.3.xml"
+    SAMPLE_PERCENTAGE = 0.0001
+    OUTPUT_FILE = f"output/cpe_extracted_data_{SAMPLE_PERCENTAGE}.xlsx"
     
-    print("🔄 Starting XML to Excel Processing...")
-    
-    # Configuration
-    xml_file = "official-cpe-dictionary_v2.3.xml"
-    output_file = "cpe_data_sample.xlsx"
-    sample_percentage = 0.01  # 1% for testing - change to 1.0 for 100%
-    
-    # Create processor and run
-    processor = CPEXMLProcessor(xml_file, sample_percentage)
-    processor.process_and_save(output_file)
-    
-    print(f"\n🎉 Process completed! Check '{output_file}' for results.")
-    print(f"💡 To process all data, change sample_percentage to 1.0 in the main() function")
+    try:
+        converter = CpeXmlToExcelConverter(
+            xml_file_path=XML_FILE_PATH,
+            sample_percentage=SAMPLE_PERCENTAGE
+        )
+        
+        converter.run(OUTPUT_FILE)
+        
+        print(f"\nConversion completed successfully!")
+        print(f"Input: {XML_FILE_PATH}")
+        print(f"Output: {OUTPUT_FILE}")
+        print(f"Sample size: {SAMPLE_PERCENTAGE*100:.2f}%")
+        
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        print(f"Please ensure {XML_FILE_PATH} exists in the current directory")
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        logger.exception("Unexpected error occurred")
 
 if __name__ == "__main__":
     main()

@@ -1,8 +1,8 @@
 # cpe_parser/cpe_parser.py
-from cpe import Cpe
-from cpe_builder import CpeBuilder
+from processor.cpe import Cpe
+from processor.cpe_builder import CpeBuilder
 from exceptions import CpeParsingException
-from cpe_builder import CpeBuilder
+from processor.cpe_builder import CpeBuilder
 from exceptions.cpe_encoding_exception import CpeEncodingException
 from exceptions.cpe_validation_exception import CpeValidationException
 from util.convert import Convert

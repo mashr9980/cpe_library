@@ -1,7 +1,7 @@
 # cpe_parser/cpe.py
 import re
 from typing import Optional, List
-from icpe import ICpe
+from processor.icpe import ICpe
 from values.part import Part
 from values.logical_value import LogicalValue
 from values.relation import Relation

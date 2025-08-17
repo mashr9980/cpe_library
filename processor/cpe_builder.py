@@ -3,7 +3,7 @@ from typing import Union
 from values.part import Part
 from values.logical_value import LogicalValue
 from util.convert import Convert
-from cpe import Cpe
+from processor.cpe import Cpe
 
 class CpeBuilder:
     def __init__(self):
