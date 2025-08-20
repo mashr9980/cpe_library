@@ -161,11 +161,10 @@ class CpeXmlToExcelConverter:
         columns = [
             "cpe","Title","vendor_human","product_human","Validation Product Name",
             "part","target_softwares","target_hardwares","versions","updates",
-            "editions","languages","references","category","Unnamed: 12"
+            "editions","languages","references","category"
         ]
         df = pd.DataFrame(data)
         df = df.reindex(columns=columns, fill_value="")
-        df["Unnamed: 12"] = ""
         with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
             df.to_excel(writer, sheet_name="Sheet1", index=False)
         logger.info(f"Excel file created successfully: {output_file}")
