@@ -458,8 +458,8 @@ class OptimizedCpeXmlToExcelConverter:
 
 def main():
     XML_FILE_PATH = os.getenv("CPE_XML_PATH", "official-cpe-dictionary_v2.3.xml")
-    SAMPLE_PERCENTAGE = float(os.getenv("CPE_SAMPLE_PERCENTAGE", "0.0001"))
-    OUTPUT_FILE = os.getenv("CPE_OUTPUT_PATH", f"output/cpe_extracted_data_{SAMPLE_PERCENTAGE}_optimized.xlsx")
+    SAMPLE_PERCENTAGE = float(os.getenv("CPE_SAMPLE_PERCENTAGE", "0.0003"))
+    OUTPUT_FILE = os.getenv("CPE_OUTPUT_PATH", f"output/cpe_extracted_data_{SAMPLE_PERCENTAGE}.xlsx")
     
     try:
         converter = OptimizedCpeXmlToExcelConverter(xml_file_path=XML_FILE_PATH, sample_percentage=SAMPLE_PERCENTAGE)

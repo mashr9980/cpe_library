@@ -1,4 +1,4 @@
-# cpe_converter_ai.py
+# main.py
 import os
 import xml.etree.ElementTree as ET
 import pandas as pd
@@ -12,6 +12,7 @@ from processor.azure_client import AzureOpenAI
 from processor.cpe_resolver_ai import CpeVendorProductResolver, _affinity
 import os
 from dotenv import load_dotenv
+from collections import defaultdict
 
 try:
     from processor.cpe import Cpe
@@ -49,20 +50,78 @@ class CpeXmlToExcelConverter:
             raise
         except FileNotFoundError:
             raise
+        
         cpe_items = root.findall(".//cpe:cpe-item", self.namespaces)
         total_items = len(cpe_items)
         sample_size = max(1, int(total_items * self.sample_percentage))
         logger.info(f"Found {total_items} CPE items, sampling {sample_size} items")
         sampled_items = random.sample(cpe_items, sample_size)
-        parsed_data = []
+        
+        grouped_data = defaultdict(lambda: {
+            'titles': set(),
+            'versions': set(),
+            'updates': set(),
+            'editions': set(),
+            'languages': set(),
+            'target_softwares': set(),
+            'target_hardwares': set(),
+            'references': set(),
+            'cpes': set(),
+            'vendor_human': None,
+            'product_human': None,
+            'part': None,
+            'category': None,
+            'validation_result': None
+        })
+        
         for item in sampled_items:
             try:
                 cpe_data = asyncio.run(self.parse_cpe_item(item))
                 if cpe_data:
-                    parsed_data.append(cpe_data)
+                    vendor_machine = cpe_data.get('vendor_machine', '')
+                    product_machine = cpe_data.get('product_machine', '')
+                    key = (vendor_machine, product_machine)
+                    
+                    group = grouped_data[key]
+                    group['titles'].add(cpe_data.get('Title', ''))
+                    group['versions'].add(cpe_data.get('versions', ['-'])[0])
+                    group['updates'].update(cpe_data.get('updates', ['*']))
+                    group['editions'].update(cpe_data.get('editions', ['*']))
+                    group['languages'].update(cpe_data.get('languages', ['*']))
+                    group['target_softwares'].update(cpe_data.get('target_softwares', ['*']))
+                    group['target_hardwares'].update(cpe_data.get('target_hardwares', ['*']))
+                    group['references'].update(cpe_data.get('references', []))
+                    group['cpes'].add(cpe_data.get('cpe', ''))
+                    
+                    if group['vendor_human'] is None:
+                        group['vendor_human'] = cpe_data.get('vendor_human', '')
+                        group['product_human'] = cpe_data.get('product_human', '')
+                        group['part'] = cpe_data.get('part', '')
+                        group['category'] = cpe_data.get('category', '')
+                        group['validation_result'] = cpe_data.get('Validation Product Name', False)
             except Exception:
                 continue
-        logger.info(f"Successfully parsed {len(parsed_data)} CPE items")
+        
+        parsed_data = []
+        for (vendor_machine, product_machine), group in grouped_data.items():
+            parsed_data.append({
+                'cpe': ' | '.join(sorted(group['cpes'])) if group['cpes'] else '',
+                'Title': ' | '.join(sorted(group['titles'])) if group['titles'] else '',
+                'vendor_human': group['vendor_human'] or vendor_machine,
+                'product_human': group['product_human'] or product_machine,
+                'Validation Product Name': group['validation_result'] or False,
+                'part': group['part'],
+                'target_softwares': list(group['target_softwares']),
+                'target_hardwares': list(group['target_hardwares']),
+                'versions': list(group['versions']),
+                'updates': list(group['updates']),
+                'editions': list(group['editions']),
+                'languages': list(group['languages']),
+                'references': list(group['references']),
+                'category': group['category']
+            })
+        
+        logger.info(f"Successfully grouped {len(parsed_data)} unique vendor-product combinations from {len(sampled_items)} CPE items")
         return parsed_data
 
     async def parse_cpe_item(self, cpe_item: ET.Element) -> Optional[Dict]:
@@ -104,6 +163,8 @@ class CpeXmlToExcelConverter:
         return {
             "cpe": cpe_string,
             "Title": title,
+            "vendor_machine": vendor_machine,
+            "product_machine": product_machine,
             "vendor_human": vendor_human,
             "product_human": product_human,
             "Validation Product Name": validation_result,
@@ -173,8 +234,8 @@ class CpeXmlToExcelConverter:
         logger.info(f"Validation passed: {valid_sum}")
         logger.info(f"Validation failed: {len(df) - valid_sum}")
 
-    def run(self, output_file: str = "cpe_extracted_data.xlsx"):
-        logger.info("Starting CPE XML to Excel conversion")
+    def run(self, output_file: str = "cpe_extracted_data_grouped.xlsx"):
+        logger.info("Starting CPE XML to Excel conversion with grouping")
         if not Path(self.xml_file_path).exists():
             raise FileNotFoundError(f"XML file not found: {self.xml_file_path}")
         cpe_data = self.parse_xml_file()
@@ -182,12 +243,12 @@ class CpeXmlToExcelConverter:
             logger.error("No valid CPE data found")
             return
         self.create_excel_file(cpe_data, output_file)
-        logger.info("CPE XML to Excel conversion completed successfully")
+        logger.info("CPE XML to Excel conversion with grouping completed successfully")
 
 def main():
     XML_FILE_PATH = os.getenv("CPE_XML_PATH", "official-cpe-dictionary_v2.3.xml")
     SAMPLE_PERCENTAGE = float(os.getenv("CPE_SAMPLE_PERCENTAGE", "0.00001"))
-    OUTPUT_FILE = os.getenv("CPE_OUTPUT_PATH", f"output/cpe_extracted_data_{SAMPLE_PERCENTAGE}.xlsx")
+    OUTPUT_FILE = os.getenv("CPE_OUTPUT_PATH", f"output/cpe_extracted_data_grouped_{SAMPLE_PERCENTAGE}.xlsx")
     try:
         converter = CpeXmlToExcelConverter(xml_file_path=XML_FILE_PATH, sample_percentage=SAMPLE_PERCENTAGE)
         converter.run(OUTPUT_FILE)
