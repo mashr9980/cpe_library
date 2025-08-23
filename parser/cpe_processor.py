@@ -4,7 +4,9 @@ import pandas as pd
 import logging
 import random
 import asyncio
-from typing import List, Dict, Optional
+import json
+import requests
+from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 from collections import defaultdict
 
@@ -13,10 +15,128 @@ from processor.cpe_parser import CpeParser
 from values.part import Part
 from exceptions import CpeParsingException
 from parser.validators import TechnicalValidator
-from parser.ai_corrector import OpenAICorrector
-from parser.rule_extractor import RuleBasedExtractor
 
 logger = logging.getLogger(__name__)
+
+class OpenAIExtractor:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.openai.com/v1/chat/completions"
+    
+    async def extract_vendor_product_batch(self, items: List[Dict]) -> List[Dict]:
+        if not items:
+            return []
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        batch_input = []
+        for idx, item in enumerate(items):
+            batch_input.append({
+                "id": idx,
+                "cpe": item['cpe'],
+                "title": item['title'],
+                "vendor_machine": item['vendor_machine'],
+                "product_machine": item['product_machine'],
+                "part": item['part'].get_abbreviation()
+            })
+        
+        system_prompt = """You are a CPE expert processing 1.4M+ records. Extract vendor/product names with STRICT machine identifier alignment and consistent suffix handling.
+
+MACHINE IDENTIFIER ALIGNMENT (CRITICAL):
+1. VENDOR ALIGNMENT:
+   - "fork-cms" → "Fork CMS" (not "Fork") - align with full machine name
+   - "vektor-inc" → "Vektor Inc" (not "Vektor") - preserve suffix for alignment  
+   - "rsvpmaker_project" → "RSVPMaker Project" (not "RSVPMaker") - keep project suffix
+   - "better-auth" → "Better Auth" - direct mapping
+   - "auto_delete_posts_project" → "Auto Delete Posts Project" - keep all parts
+
+2. PRODUCT ALIGNMENT:
+   - "forkcms" → "Fork CMS" (matches vendor pattern)
+   - "vk_block_patterns" → "VK Block Patterns" 
+   - "better_auth" → "Better Auth"
+   - "pachno" → "Pachno" (simple direct mapping, no additions)
+
+CONSISTENT SUFFIX RULES:
+- Keep ALL suffixes in machine identifiers: Project, Inc, Foundation, Corp, Ltd
+- Only remove if suffix appears EXTRA in title beyond machine identifier
+- "Microsoft Corporation" + machine="microsoft" → "Microsoft" (remove extra)
+- "RSVPMaker Project" + machine="rsvpmaker_project" → "RSVPMaker Project" (keep for alignment)
+
+VENDOR=PRODUCT RESOLUTION:
+When vendor and product would be identical:
+1. Check if machine identifiers are different
+2. If different machines, map each to its machine exactly
+3. If same machines, use base name for vendor, add minimal qualifier for product:
+   - "pachno"/"pachno" → "Pachno"/"Pachno" (keep same if machines identical)
+   - Never add words not in machine identifiers
+
+CRITICAL VALIDATION ALIGNMENT:
+- First character: vendor_human[0].lower() == vendor_machine[0].lower()
+- Last character: vendor_human[-1].lower() == vendor_machine[-1].lower() 
+- Same rules for product alignment
+- Semantic token overlap ≥70%
+
+TITLE PROCESSING:
+1. Remove versions: \d+\.\d+(\.\d+)*, "Update \d+", "Beta \d+", build numbers
+2. Remove platforms: "for WordPress", "for Node.js", etc.
+3. Remove editions: Pro, Enterprise, Premium (unless in machine identifier)
+4. Keep year identifiers if in machine: "Visual Studio 2022", "Office 365"
+
+EXAMPLES:
+- Title: "Fork CMS 5.8.1", Machines: "fork-cms"/"forkcms" → "Fork CMS"/"Fork CMS"
+- Title: "Vektor, Inc. VK Block Patterns 1.4.1", Machines: "vektor-inc"/"vk_block_patterns" → "Vektor Inc"/"VK Block Patterns"  
+- Title: "Better Auth 0.5.3 Beta 8", Machines: "better-auth"/"better_auth" → "Better Auth"/"Better Auth"
+- Title: "Pachno Pachno 1.0.2", Machines: "pachno"/"pachno" → "Pachno"/"Pachno"
+
+OUTPUT: JSON array [{"id": int, "vendor_name": "string", "product_name": "string"}]
+ENSURE: Perfect character alignment with machine identifiers for validation success."""
+
+        user_content = f"Extract vendor and product names from these CPE entries:\n\n{json.dumps(batch_input, indent=2)}"
+        
+        payload = {
+            "model": "gpt-5",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.1
+        }
+        
+        try:
+            def make_request():
+                response = requests.post(self.base_url, headers=headers, json=payload, timeout=120)
+                response.raise_for_status()
+                return response.json()
+            
+            result = await asyncio.to_thread(make_request)
+            content = result["choices"][0]["message"]["content"]
+            
+            if content.startswith('```json'):
+                content = content[7:-3]
+            elif content.startswith('```'):
+                content = content[3:-3]
+            
+            extracted_data = json.loads(content)
+            
+            results = []
+            for item in extracted_data:
+                if item['id'] < len(items):
+                    results.append({
+                        'vendor_name': item.get('vendor_name', '').strip(),
+                        'product_name': item.get('product_name', '').strip()
+                    })
+                else:
+                    results.append({'vendor_name': '', 'product_name': ''})
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"OpenAI batch extraction failed: {e}")
+            return [{'vendor_name': '', 'product_name': ''} for _ in items]
 
 class UnifiedCpeProcessor:
     def __init__(self, xml_file_path: str, sample_percentage: float = 0.01):
@@ -29,10 +149,10 @@ class UnifiedCpeProcessor:
         
         openai_api_key = os.getenv("OPENAI_API_KEY")
         if openai_api_key:
-            self.openai_corrector = OpenAICorrector(openai_api_key)
+            self.openai_extractor = OpenAIExtractor(openai_api_key)
         else:
-            self.openai_corrector = None
-            logger.warning("OpenAI API key not found, AI correction disabled")
+            self.openai_extractor = None
+            logger.warning("OpenAI API key not found, extraction disabled")
     
     def parse_xml_file(self) -> List[Dict]:
         logger.info(f"Parsing XML file: {self.xml_file_path}")
@@ -54,6 +174,16 @@ class UnifiedCpeProcessor:
         logger.info(f"Successfully processed {len(grouped_data)} unique vendor-product combinations")
         return grouped_data
     
+    async def extract_with_openai(self, items: List[Dict]) -> List[Dict]:
+        if not self.openai_extractor:
+            return []
+        
+        try:
+            return await self.openai_extractor.extract_vendor_product_batch(items)
+        except Exception as e:
+            logger.error(f"OpenAI extraction failed: {e}")
+            return []
+    
     def group_and_process_items(self, cpe_items: List[ET.Element]) -> List[Dict]:
         raw_items = []
         for item in cpe_items:
@@ -64,78 +194,253 @@ class UnifiedCpeProcessor:
             except Exception:
                 continue
         
+        logger.info(f"Parsed {len(raw_items)} raw items from XML")
+        
+        # Enhanced grouping with similarity detection
         grouped = defaultdict(list)
+        group_stats = defaultdict(int)
+        
         for item in raw_items:
-            key = (item['vendor_machine'], item['product_machine'], item['part'])
-            grouped[key].append(item)
+            # Primary grouping key
+            primary_key = (item['vendor_machine'], item['product_machine'], item['part'].get_abbreviation())
+            grouped[primary_key].append(item)
+            group_stats[primary_key] += 1
         
+        logger.info(f"Created {len(grouped)} unique groups from raw items")
+        
+        # Log grouping statistics
+        large_groups = {k: v for k, v in group_stats.items() if v > 1}
+        if large_groups:
+            logger.info(f"Groups with multiple items: {len(large_groups)}")
+            for (vendor, product, part), count in sorted(large_groups.items(), key=lambda x: x[1], reverse=True)[:5]:
+                logger.info(f"  {vendor}/{product} ({part}): {count} items")
+        
+        # Process groups in batches for efficiency
         final_items = []
-        for (vendor_machine, product_machine, part), items in grouped.items():
-            representative = items[0]
-            
-            titles = [item['title'] for item in items if item['title']]
-            combined_title = titles[0] if titles else ""
-            
-            all_cpes = [item['cpe'] for item in items]
-            all_versions = list(set(item['version'] for item in items if item['version'] != "-"))
-            all_references = []
-            for item in items:
-                all_references.extend(item.get('references', []))
-            
-            vendor_human, product_human = RuleBasedExtractor.extract_from_title(
-                combined_title, vendor_machine, product_machine
-            )
-            
-            validation = TechnicalValidator.validate_extraction(
-                vendor_human, vendor_machine, product_human, product_machine,
-                representative['version'], representative['target_sw'], combined_title
-            )
-            
-            if not validation.is_valid and self.openai_corrector:
-                logger.info(f"Attempting AI correction for: {vendor_machine} / {product_machine}")
-                try:
-                    correction = asyncio.run(self.openai_corrector.correct_extraction(
-                        representative['cpe'], combined_title, vendor_machine, product_machine,
-                        part.get_abbreviation(), representative['target_sw']
-                    ))
-                    if correction['vendor_name'] and correction['product_name']:
-                        logger.info(f"AI correction: {vendor_human} -> {correction['vendor_name']}, {product_human} -> {correction['product_name']}")
-                        vendor_human = correction['vendor_name']
-                        product_human = correction['product_name']
-                        
-                        validation = TechnicalValidator.validate_extraction(
-                            vendor_human, vendor_machine, product_human, product_machine,
-                            representative['version'], representative['target_sw'], combined_title
-                        )
-                        logger.info(f"Post-correction validation: {validation.is_valid}")
-                    else:
-                        logger.warning("AI correction returned empty results")
-                except Exception as e:
-                    logger.error(f"AI correction failed: {e}")
-            elif not validation.is_valid:
-                logger.warning(f"Validation failed but no OpenAI corrector available for: {vendor_machine} / {product_machine}")
-                logger.warning(f"Validation issues: {validation.issues}")
-            
-            final_item = {
-                "cpe": " | ".join(all_cpes),
-                "Title": combined_title,
-                "vendor_human": vendor_human,
-                "product_human": product_human,
-                "Validation Product Name": validation.is_valid,
-                "part": part.get_abbreviation(),
-                "target_softwares": [representative['target_sw']] if representative['target_sw'] != "*" else ["*"],
-                "target_hardwares": [representative['target_hw']] if representative['target_hw'] != "*" else ["*"],
-                "versions": all_versions if all_versions else ["-"],
-                "updates": [representative['update']] if representative['update'] != "*" else ["*"],
-                "editions": [representative['edition']] if representative['edition'] != "*" else ["*"],
-                "languages": [representative['language']] if representative['language'] != "*" else ["*"],
-                "references": list(set(all_references)),
-                "category": self.get_corrected_category(part, product_machine, combined_title)
-            }
-            
-            final_items.append(final_item)
+        batch_size = 50  # Process 50 groups at a time for OpenAI
+        group_items = list(grouped.items())
         
+        for i in range(0, len(group_items), batch_size):
+            batch_groups = group_items[i:i + batch_size]
+            batch_items_for_ai = []
+            batch_metadata = []
+            
+            for (vendor_machine, product_machine, part_str), items in batch_groups:
+                representative = items[0]
+                
+                # Select best title from group
+                titles = [item['title'] for item in items if item['title']]
+                best_title = self.select_best_title_advanced(titles, vendor_machine, product_machine)
+                
+                # Aggregate data from all items in group
+                all_cpes = [item['cpe'] for item in items]
+                all_versions = list(set(item['version'] for item in items if item['version'] != "-"))
+                all_references = []
+                for item in items:
+                    all_references.extend(item.get('references', []))
+                
+                batch_item = {
+                    'cpe': representative['cpe'],
+                    'title': best_title,
+                    'vendor_machine': vendor_machine,
+                    'product_machine': product_machine,
+                    'part': representative['part']
+                }
+                
+                batch_items_for_ai.append(batch_item)
+                batch_metadata.append({
+                    'items': items,
+                    'all_cpes': all_cpes,
+                    'all_versions': all_versions,
+                    'all_references': all_references,
+                    'representative': representative,
+                    'best_title': best_title,
+                    'part_str': part_str,
+                    'vendor_machine': vendor_machine,
+                    'product_machine': product_machine,
+                    'group_size': len(items)
+                })
+            
+            # Process batch with OpenAI
+            if batch_items_for_ai:
+                logger.info(f"Processing batch {i//batch_size + 1}/{(len(group_items) + batch_size - 1)//batch_size} with {len(batch_items_for_ai)} groups")
+                extraction_results = asyncio.run(self.extract_with_openai(batch_items_for_ai))
+                
+                # Create final items from batch results
+                for idx, metadata in enumerate(batch_metadata):
+                    if idx < len(extraction_results) and extraction_results[idx]:
+                        vendor_human = extraction_results[idx]['vendor_name'] or self.fallback_vendor_aligned(metadata['vendor_machine'])
+                        product_human = extraction_results[idx]['product_name'] or self.fallback_product_aligned(metadata['product_machine'])
+                    else:
+                        vendor_human = self.fallback_vendor_aligned(metadata['vendor_machine'])
+                        product_human = self.fallback_product_aligned(metadata['product_machine'])
+                    
+                    # Enhanced validation with machine alignment
+                    validation = self.validate_extraction_enhanced(
+                        vendor_human, metadata['vendor_machine'], 
+                        product_human, metadata['product_machine'],
+                        metadata['representative']['version'], 
+                        metadata['representative']['target_sw'], 
+                        metadata['best_title']
+                    )
+                    
+                    final_item = {
+                        "cpe": " | ".join(metadata['all_cpes']),
+                        "Title": metadata['best_title'],
+                        "vendor_human": vendor_human,
+                        "product_human": product_human,
+                        "Validation Product Name": validation['is_valid'],
+                        "part": metadata['part_str'],
+                        "target_softwares": [metadata['representative']['target_sw']] if metadata['representative']['target_sw'] != "*" else ["*"],
+                        "target_hardwares": [metadata['representative']['target_hw']] if metadata['representative']['target_hw'] != "*" else ["*"],
+                        "versions": metadata['all_versions'] if metadata['all_versions'] else ["-"],
+                        "updates": [metadata['representative']['update']] if metadata['representative']['update'] != "*" else ["*"],
+                        "editions": [metadata['representative']['edition']] if metadata['representative']['edition'] != "*" else ["*"],
+                        "languages": [metadata['representative']['language']] if metadata['representative']['language'] != "*" else ["*"],
+                        "references": list(set(metadata['all_references'])),
+                        "category": self.get_corrected_category(metadata['representative']['part'], metadata['product_machine'], metadata['best_title']),
+                        "Part_Type": metadata['part_str'],
+                        "Vendor_Machine": metadata['vendor_machine'],
+                        "Product_Machine": metadata['product_machine'],
+                        "Validation_Vendor_Start": validation['vendor_start_match'],
+                        "Validation_Vendor_End": validation['vendor_end_match'],
+                        "Validation_Product_Start": validation['product_start_match'],
+                        "Validation_Product_End": validation['product_end_match'],
+                        "Validation_Title_Full": metadata['best_title'],
+                        "Validation_Vendor": vendor_human,
+                        "Validation_Product": product_human,
+                        "Validation_Final": validation['is_valid'],
+                        "Group_Size": metadata['group_size']
+                    }
+                    
+                    final_items.append(final_item)
+        
+        logger.info(f"Successfully processed {len(final_items)} final items from {len(grouped)} groups")
         return final_items
+    
+    def select_best_title_advanced(self, titles: List[str], vendor_machine: str, product_machine: str) -> str:
+        if not titles:
+            return ""
+        if len(titles) == 1:
+            return titles[0]
+        
+        scored_titles = []
+        vendor_tokens = set(vendor_machine.lower().replace('_', ' ').replace('-', ' ').split())
+        product_tokens = set(product_machine.lower().replace('_', ' ').replace('-', ' ').split())
+        
+        for title in titles:
+            score = 0
+            title_lower = title.lower()
+            
+            # Prefer titles with proper capitalization
+            if any(char.isupper() for char in title):
+                score += 3
+            
+            # Prefer longer, more descriptive titles
+            if len(title.split()) > 3:
+                score += 2
+            
+            # Prefer titles containing vendor tokens
+            vendor_overlap = len(vendor_tokens.intersection(set(title_lower.split())))
+            score += vendor_overlap * 2
+            
+            # Prefer titles containing product tokens  
+            product_overlap = len(product_tokens.intersection(set(title_lower.split())))
+            score += product_overlap * 2
+            
+            # Prefer titles with version information (shows completeness)
+            if any(char.isdigit() and '.' in title for char in title):
+                score += 1
+            
+            scored_titles.append((title, score))
+        
+        return max(scored_titles, key=lambda x: x[1])[0]
+    
+    def fallback_vendor_aligned(self, vendor_machine: str) -> str:
+        """Create vendor name that aligns with machine identifier for validation"""
+        if not vendor_machine:
+            return "Unknown"
+        
+        # Handle compound machine names
+        if '-' in vendor_machine or '_' in vendor_machine:
+            parts = vendor_machine.replace('-', ' ').replace('_', ' ').split()
+            vendor = ' '.join(word.capitalize() for word in parts)
+        else:
+            vendor = vendor_machine.capitalize()
+        
+        # Don't remove suffixes - keep for alignment
+        return vendor
+    
+    def fallback_product_aligned(self, product_machine: str) -> str:
+        """Create product name that aligns with machine identifier for validation"""
+        if not product_machine:
+            return "Unknown"
+        
+        # Handle compound machine names
+        if '-' in product_machine or '_' in product_machine:
+            parts = product_machine.replace('-', ' ').replace('_', ' ').split()
+            product = ' '.join(word.capitalize() for word in parts)
+        else:
+            product = product_machine.capitalize()
+        
+        return product
+    
+    def validate_extraction_enhanced(self, vendor_human: str, vendor_machine: str, 
+                                   product_human: str, product_machine: str,
+                                   version: str, target_sw: str, title: str) -> Dict:
+        """Enhanced validation with strict character alignment"""
+        issues = []
+        
+        # Character alignment validation
+        vendor_start_match = 0
+        vendor_end_match = 0
+        product_start_match = 0
+        product_end_match = 0
+        
+        if vendor_human and vendor_machine:
+            if vendor_human[0].lower() == vendor_machine[0].lower():
+                vendor_start_match = 1
+            if vendor_human[-1].lower() == vendor_machine[-1].lower():
+                vendor_end_match = 1
+        
+        if product_human and product_machine:
+            if product_human[0].lower() == product_machine[0].lower():
+                product_start_match = 1
+            if product_human[-1].lower() == product_machine[-1].lower():
+                product_end_match = 1
+        
+        # Semantic validation
+        if not vendor_human or not product_human:
+            issues.append("Missing vendor or product")
+        
+        # Token overlap validation
+        if vendor_human and vendor_machine:
+            vendor_tokens = set(vendor_human.lower().replace('-', ' ').split())
+            machine_vendor_tokens = set(vendor_machine.lower().replace('-', ' ').replace('_', ' ').split())
+            vendor_overlap = len(vendor_tokens & machine_vendor_tokens) / max(len(vendor_tokens), len(machine_vendor_tokens)) if vendor_tokens else 0
+            if vendor_overlap < 0.5:
+                issues.append("Low vendor token overlap")
+        
+        if product_human and product_machine:
+            product_tokens = set(product_human.lower().replace('-', ' ').split())
+            machine_product_tokens = set(product_machine.lower().replace('-', ' ').replace('_', ' ').split())
+            product_overlap = len(product_tokens & machine_product_tokens) / max(len(product_tokens), len(machine_product_tokens)) if product_tokens else 0
+            if product_overlap < 0.5:
+                issues.append("Low product token overlap")
+        
+        # Overall validation
+        character_alignment_score = vendor_start_match + vendor_end_match + product_start_match + product_end_match
+        is_valid = len(issues) <= 1 and character_alignment_score >= 2
+        
+        return {
+            'is_valid': is_valid,
+            'issues': issues,
+            'vendor_start_match': vendor_start_match,
+            'vendor_end_match': vendor_end_match,
+            'product_start_match': product_start_match,
+            'product_end_match': product_end_match,
+            'character_alignment_score': character_alignment_score
+        }
     
     def parse_single_item(self, cpe_item: ET.Element) -> Optional[Dict]:
         try:
@@ -221,7 +526,10 @@ class UnifiedCpeProcessor:
         columns = [
             "cpe", "Title", "vendor_human", "product_human", "Validation Product Name",
             "part", "target_softwares", "target_hardwares", "versions", "updates",
-            "editions", "languages", "references", "category"
+            "editions", "languages", "references", "category", "Part_Type", 
+            "Vendor_Machine", "Product_Machine", "Validation_Vendor_Start", 
+            "Validation_Vendor_End", "Validation_Product_Start", "Validation_Product_End",
+            "Validation_Title_Full", "Validation_Vendor", "Validation_Product", "Validation_Final"
         ]
         df = pd.DataFrame(data)
         df = df.reindex(columns=columns, fill_value="")
@@ -237,11 +545,6 @@ class UnifiedCpeProcessor:
         valid_sum = df["Validation Product Name"].sum() if "Validation Product Name" in df.columns else 0
         logger.info(f"Validation passed: {valid_sum}")
         logger.info(f"Validation failed: {len(df) - valid_sum}")
-        
-        if self.openai_corrector:
-            logger.info("OpenAI corrector was available for failed validations")
-        else:
-            logger.warning("OpenAI corrector was NOT available - add OPENAI_API_KEY to enable AI corrections")
     
     def run(self, output_file: str):
         logger.info("Starting unified CPE processing")

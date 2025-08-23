@@ -7,9 +7,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 def main():
-    XML_FILE_PATH = os.getenv("CPE_XML_PATH", "official-cpe-dictionary_v2.3.xml")
-    SAMPLE_PERCENTAGE = float(os.getenv("CPE_SAMPLE_PERCENTAGE", "0.0001"))
-    OUTPUT_FILE = os.getenv("CPE_OUTPUT_PATH", f"output/cpe_unified_{SAMPLE_PERCENTAGE}.xlsx")
+    XML_FILE_PATH = os.getenv("CPE_XML_PATH")
+    SAMPLE_PERCENTAGE = float(os.getenv("CPE_SAMPLE_PERCENTAGE"))
+    OUTPUT_FILE = os.getenv("CPE_OUTPUT_PATH")
     
     try:
         processor = UnifiedCpeProcessor(xml_file_path=XML_FILE_PATH, sample_percentage=SAMPLE_PERCENTAGE)
