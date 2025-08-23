@@ -1,4 +1,3 @@
-# cpe_parser/__init__.py
 from exceptions import CpeParsingException
 from processor.cpe import Cpe
 from processor.cpe_builder import CpeBuilder
