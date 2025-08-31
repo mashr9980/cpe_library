@@ -433,7 +433,7 @@ If no valid product position found:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
             ],
-            "max_tokens": 2000,
+            # "max_tokens": 2000,
             "temperature": 0.0
         }
         
