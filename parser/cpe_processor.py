@@ -15,327 +15,15 @@ from processor.cpe import Cpe
 from processor.cpe_parser import CpeParser
 from values.part import Part
 from exceptions import CpeParsingException
-from parser.validators import TechnicalValidator
 
 logger = logging.getLogger(__name__)
 
-def jaro_winkler_similarity(s1: str, s2: str) -> float:
-    """Calculate Jaro-Winkler similarity between two strings (lowercase comparison)"""
-    s1, s2 = s1.lower(), s2.lower()
-    
-    if s1 == s2:
-        return 1.0
-    
-    len1, len2 = len(s1), len(s2)
-    if len1 == 0 or len2 == 0:
-        return 0.0
-    
-    # Maximum allowed distance
-    match_distance = max(len1, len2) // 2 - 1
-    if match_distance < 0:
-        match_distance = 0
-    
-    # Initialize match arrays
-    s1_matches = [False] * len1
-    s2_matches = [False] * len2
-    
-    matches = 0
-    transpositions = 0
-    
-    # Find matches
-    for i in range(len1):
-        start = max(0, i - match_distance)
-        end = min(i + match_distance + 1, len2)
-        
-        for j in range(start, end):
-            if s2_matches[j] or s1[i] != s2[j]:
-                continue
-            s1_matches[i] = s2_matches[j] = True
-            matches += 1
-            break
-    
-    if matches == 0:
-        return 0.0
-    
-    # Count transpositions
-    k = 0
-    for i in range(len1):
-        if not s1_matches[i]:
-            continue
-        while not s2_matches[k]:
-            k += 1
-        if s1[i] != s2[k]:
-            transpositions += 1
-        k += 1
-    
-    # Calculate Jaro similarity
-    jaro = (matches / len1 + matches / len2 + (matches - transpositions / 2) / matches) / 3.0
-    
-    # Calculate common prefix (up to 4 characters)
-    prefix = 0
-    for i in range(min(len1, len2, 4)):
-        if s1[i] == s2[i]:
-            prefix += 1
-        else:
-            break
-    
-    # Calculate Jaro-Winkler similarity
-    return jaro + (0.1 * prefix * (1 - jaro))
-
-class SystematicExtractor:
-    @staticmethod
-    def remove_version_from_title(title: str, version: str) -> str:
-        """Remove version from title using comprehensive patterns"""
-        if not title:
-            return ""
-        
-        # If we have an explicit version, try to remove it first
-        if version and version not in ["*", "-"]:
-            # Escape special regex characters in version
-            version_escaped = re.escape(version)
-            # Try to remove the version with optional prefixes
-            patterns = [
-                rf'\s+v?{version_escaped}(?:\s|$)',
-                rf'\s+{version_escaped}(?:\s|$)',
-                rf'\s+version\s+{version_escaped}(?:\s|$)',
-            ]
-            
-            for pattern in patterns:
-                title = re.sub(pattern, ' ', title, flags=re.I)
-        
-        # Remove common version patterns
-        version_patterns = [
-            r'\s+v?\d+\.[\d\w\.\-\(\)]+(?:\s|$)',        # v1.2.3, 1.2.3.4, 12.0(31)SZ2
-            r'\s+\d{4}v?[\d\.\-]+(?:\s|$)',              # 7400v2.02.01.2019
-            r'\s+\d+\.\d+\(\d+\)[A-Z]+\d*(?:\s|$)',      # 12.0(31)SZ2
-            r'\s+build\s+\d+(?:\s|$)',                    # build 123
-            r'\s+(?:beta|alpha|rc)\s*\d*(?:\s|$)',        # beta, alpha, rc1
-            r'\s+\d{4}(?:\.\d+)*(?:\s|$)',               # 2023, 2023.1
-        ]
-        
-        for pattern in version_patterns:
-            title = re.sub(pattern, ' ', title, flags=re.I)
-        
-        return re.sub(r'\s+', ' ', title).strip()
-    
-    @staticmethod
-    def remove_cpe_components_from_title(title: str, update: str, edition: str, language: str, 
-                                        sw_edition: str, target_sw: str, target_hw: str, other: str) -> str:
-        """Remove CPE components from title when no version exists"""
-        if not title:
-            return ""
-        
-        components = [update, edition, language, sw_edition, target_sw, target_hw, other]
-        valid_components = [comp.replace('_', ' ') for comp in components 
-                           if comp and comp not in ['*', '-']]
-        
-        result_title = title
-        for comp in valid_components:
-            # Remove component with optional "for" prefix
-            patterns = [
-                rf'\s+for\s+{re.escape(comp)}(?:\s|$)',
-                rf'\s+{re.escape(comp)}(?:\s|$)',
-                rf'\s+on\s+{re.escape(comp)}(?:\s|$)',
-            ]
-            
-            for pattern in patterns:
-                result_title = re.sub(pattern, ' ', result_title, flags=re.I)
-        
-        return re.sub(r'\s+', ' ', result_title).strip()
-    
-    @staticmethod
-    def get_most_common_left_correct(titles: List[str], versions: List[str], 
-                                   updates: List[str], editions: List[str], languages: List[str],
-                                   sw_editions: List[str], target_sws: List[str], 
-                                   target_hws: List[str], others: List[str]) -> str:
-        """Get most common left part by properly removing versions and components"""
-        if not titles:
-            return ""
-        
-        cleaned_titles = []
-        
-        for i, title in enumerate(titles):
-            if not title:
-                continue
-                
-            # Get corresponding components for this title
-            version = versions[i] if i < len(versions) else ""
-            update = updates[i] if i < len(updates) else "*"
-            edition = editions[i] if i < len(editions) else "*"
-            language = languages[i] if i < len(languages) else "*"
-            sw_edition = sw_editions[i] if i < len(sw_editions) else "*"
-            target_sw = target_sws[i] if i < len(target_sws) else "*"
-            target_hw = target_hws[i] if i < len(target_hws) else "*"
-            other = others[i] if i < len(others) else "*"
-            
-            # First remove version
-            cleaned = SystematicExtractor.remove_version_from_title(title, version)
-            
-            # Then remove other CPE components
-            cleaned = SystematicExtractor.remove_cpe_components_from_title(
-                cleaned, update, edition, language, sw_edition, target_sw, target_hw, other
-            )
-            
-            if cleaned:
-                cleaned_titles.append(cleaned)
-        
-        if not cleaned_titles:
-            return ""
-        
-        # Return most frequent cleaned title
-        counter = Counter(cleaned_titles)
-        return counter.most_common(1)[0][0]
-    
-    @staticmethod
-    def split_vendor_product_systematic(most_common_left: str, vendor_machine: str, product_machine: str) -> Tuple[str, str]:
-        """Split vendor and product using systematic methodology"""
-        if not most_common_left:
-            return vendor_machine.replace('_', ' ').replace('-', ' '), product_machine.replace('_', ' ').replace('-', ' ')
-        
-        # Handle vendor=product case
-        if vendor_machine == product_machine:
-            return most_common_left, most_common_left
-        
-        # Convert product machine to tokens
-        product_tokens = product_machine.replace('_', ' ').replace('-', ' ').lower().split()
-        if not product_tokens:
-            # Fallback to first space split
-            parts = most_common_left.split(' ', 1)
-            return (parts[0], parts[1]) if len(parts) == 2 else (most_common_left, product_machine)
-        
-        # Find product start position (must be word boundary)
-        text_lower = most_common_left.lower()
-        first_token = product_tokens[0]
-        
-        # Find all positions where first product token starts at word boundary
-        valid_positions = []
-        start = 0
-        while True:
-            pos = text_lower.find(first_token, start)
-            if pos == -1:
-                break
-            
-            # Check if it's a word boundary (after space/start, before space/end)
-            is_word_start = (pos == 0) or (not most_common_left[pos - 1].isalnum())
-            end_pos = pos + len(first_token)
-            is_word_end = (end_pos >= len(most_common_left)) or (not most_common_left[end_pos].isalnum())
-            
-            # Must not start at beginning and must be word boundary
-            if pos > 0 and is_word_start and is_word_end:
-                valid_positions.append(pos)
-            
-            start = pos + 1
-        
-        if not valid_positions:
-            # No valid product position found, split at first space
-            space_pos = most_common_left.find(' ')
-            if space_pos > 0:
-                return most_common_left[:space_pos], most_common_left[space_pos + 1:]
-            else:
-                return most_common_left, product_machine.replace('_', ' ').replace('-', ' ')
-        
-        # Score positions based on token overlap
-        best_pos = valid_positions[0]
-        best_score = 0
-        
-        for pos in valid_positions:
-            product_part = most_common_left[pos:].strip()
-            product_part_tokens = set(product_part.lower().split())
-            machine_tokens = set(product_tokens)
-            
-            overlap = len(product_part_tokens & machine_tokens)
-            if overlap > best_score:
-                best_score = overlap
-                best_pos = pos
-        
-        # Split at best position
-        vendor_part = most_common_left[:best_pos].strip()
-        product_part = most_common_left[best_pos:].strip()
-        
-        return vendor_part, product_part
-    
-    @staticmethod
-    def validate_systematic(title: str, vendor_extracted: str, product_extracted: str,
-                          vendor_machine: str, product_machine: str, 
-                          version: str, update: str, edition: str, language: str,
-                          sw_edition: str, target_sw: str, target_hw: str, other: str) -> Dict:
-        """Validate extraction using systematic approach"""
-        issues = []
-        
-        # Step 1: Reconstruct and validate against title
-        reconstructed = f"{vendor_extracted} {product_extracted}".strip()
-        
-        # Clean the original title same way we did for extraction
-        title_cleaned = SystematicExtractor.remove_version_from_title(title, version)
-        title_cleaned = SystematicExtractor.remove_cpe_components_from_title(
-            title_cleaned, update, edition, language, sw_edition, target_sw, target_hw, other
-        )
-        
-        # Case-sensitive validation
-        if not title_cleaned.startswith(reconstructed):
-            # Also try with original title
-            if not title.startswith(reconstructed):
-                issues.append("Reconstruction fails to match title beginning")
-        
-        # Step 2: Character validation
-        vendor_start_match = 0
-        vendor_end_match = 0
-        product_start_match = 0
-        product_end_match = 0
-        
-        if vendor_extracted and vendor_machine:
-            v_clean = re.sub(r'[^a-zA-Z0-9]', '', vendor_extracted.lower())
-            vm_clean = re.sub(r'[^a-zA-Z0-9]', '', vendor_machine.lower())
-            if v_clean and vm_clean:
-                if v_clean[0] == vm_clean[0]:
-                    vendor_start_match = 1
-                if v_clean[-1] == vm_clean[-1]:
-                    vendor_end_match = 1
-        
-        if product_extracted and product_machine:
-            p_clean = re.sub(r'[^a-zA-Z0-9]', '', product_extracted.lower())
-            pm_clean = re.sub(r'[^a-zA-Z0-9]', '', product_machine.lower())
-            if p_clean and pm_clean:
-                if p_clean[0] == pm_clean[0]:
-                    product_start_match = 1
-                if p_clean[-1] == pm_clean[-1]:
-                    product_end_match = 1
-        
-        # Step 3: Similarity validation
-        vendor_similarity = jaro_winkler_similarity(vendor_extracted or "", vendor_machine or "")
-        product_similarity = jaro_winkler_similarity(product_extracted or "", product_machine or "")
-        
-        # Step 4: Overall validation
-        char_score = vendor_start_match + vendor_end_match + product_start_match + product_end_match
-        similarity_threshold = 0.7
-        
-        if vendor_similarity < similarity_threshold:
-            issues.append(f"Low vendor similarity: {vendor_similarity:.3f}")
-        if product_similarity < similarity_threshold:
-            issues.append(f"Low product similarity: {product_similarity:.3f}")
-        
-        is_valid = (len(issues) <= 1 and char_score >= 2 and 
-                   vendor_similarity >= similarity_threshold and 
-                   product_similarity >= similarity_threshold)
-        
-        return {
-            'is_valid': is_valid,
-            'issues': issues,
-            'vendor_start_match': vendor_start_match,
-            'vendor_end_match': vendor_end_match,
-            'product_start_match': product_start_match,
-            'product_end_match': product_end_match,
-            'vendor_similarity': round(vendor_similarity, 3),
-            'product_similarity': round(product_similarity, 3),
-            'char_alignment_score': char_score
-        }
-
-class OpenAIExtractor:
+class IntelligentOpenAIProcessor:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.openai.com/v1/chat/completions"
     
-    async def extract_vendor_product_batch(self, items: List[Dict]) -> List[Dict]:
+    async def process_title_batch(self, items: List[Dict]) -> List[Dict]:
         if not items:
             return []
         
@@ -344,139 +32,184 @@ class OpenAIExtractor:
             "Content-Type": "application/json"
         }
         
-        batch_input = []
+        batch_data = []
         for idx, item in enumerate(items):
-            batch_input.append({
-                "id": item['cpe'],
-                "group_identifier": f"{item['vendor_machine']}|{item['product_machine']}",
-                "title": item['title'],
-                "vendor_machine": item['vendor_machine'],
-                "product_machine": item['product_machine'],
+            batch_data.append({
+                "id": idx,
+                "title": item.get('title', ''),
+                "vendor_machine": item.get('vendor_machine', ''),
+                "product_machine": item.get('product_machine', ''),
                 "version": item.get('version', '*'),
-                "most_common_left": item.get('most_common_left', ''),
-                "group_size": item.get('group_size', 1),
-                "sample_titles": item.get('sample_titles', [])
+                "update": item.get('update', '*'),
+                "edition": item.get('edition', '*'),
+                "language": item.get('language', '*'),
+                "sw_edition": item.get('sw_edition', '*'),
+                "target_sw": item.get('target_sw', '*'),
+                "target_hw": item.get('target_hw', '*'),
+                "other": item.get('other', '*'),
+                "all_titles": item.get('all_titles', []),
+                "all_versions": item.get('all_versions', [])
             })
         
-        system_prompt = """You are a CPE expert implementing EXACT systematic methodology. Follow this PRECISE algorithm:
+        system_prompt = """You are an expert CPE (Common Platform Enumeration) processor handling 1.4M+ records. Your task is to intelligently extract clean vendor and product names from software/hardware titles.
 
-**ALGORITHM STEPS:**
+**CORE OBJECTIVE:**
+Extract human-readable vendor and product names that reconstruct perfectly back to a cleaned title.
 
-STEP 1: UNDERSTAND THE GROUP
-- group_identifier shows the exact (vendor_machine|product_machine) pattern
-- All items in group share identical machine identifiers
-- most_common_left is the correctly cleaned title (versions/components removed)
+**KEY PRINCIPLES:**
 
-STEP 2: LOCATE PRODUCT START POSITION
-- Find where product_machine tokens appear in most_common_left
-- CRITICAL: Product must start AFTER a space (word boundary), NEVER at beginning
-- Search case-insensitive but preserve original casing
+1. **INTELLIGENT TITLE CLEANING**
+   - Remove version numbers, build numbers, release candidates, betas, alphas
+   - Remove platform/target info (for Windows, for Android, etc.)
+   - Remove edition info (Enterprise, Pro, Free, etc.) unless core to product identity
+   - Remove extra descriptive text while preserving essential product identity
+   - Result should be: "[Vendor] [Product]" format
 
-STEP 3: SPLIT AT CORRECT POSITION
-- Vendor = everything BEFORE product start position
-- Product = everything FROM product start position onward
-- Preserve exact casing from most_common_left
+2. **SMART VENDOR-PRODUCT SPLITTING**
+   - Use vendor_machine and product_machine as intelligent hints for boundaries
+   - Handle complex patterns: "[Company] Project [Product]", "[Org] [Long Product Name]"
+   - Preserve complete company names: "Apache Software Foundation", "Red Hat"
+   - Handle parenthetical info intelligently: "Company (Details)" vs "Product (Feature)"
 
-**CRITICAL EXAMPLES:**
+3. **MACHINE IDENTIFIER ALIGNMENT**
+   - Ensure first/last characters align between human names and machine identifiers
+   - vendor_human[0].lower() == vendor_machine[0], vendor_human[-1].lower() == vendor_machine[-1]  
+   - Same alignment rules for product names
+   - Handle special characters by ignoring them for alignment (spaces, hyphens, underscores)
 
-Example 1:
-- group_identifier: "dell|g5"  
-- most_common_left: "Dell G5"
-- Algorithm: Find "g5" → appears as "G5" starting at position 5 (after space)
-- Result: vendor="Dell", product="G5"
+4. **CONTEXT-AWARE DECISIONS**
+   - Use all_titles array to understand patterns across related entries
+   - Use all_versions to distinguish between version info and product names
+   - When vendor_machine == product_machine, both extractions should typically be identical
+   - Consider target platforms and editions as context, not core identity
 
-Example 2:
-- group_identifier: "mulesoft|apikit"
-- most_common_left: "MuleSoft APIKit" 
-- Algorithm: Find "apikit" → appears as "APIKit" starting at position 9 (after space)
-- Result: vendor="MuleSoft", product="APIKit"
+5. **QUALITY VALIDATION**
+   - Reconstructed "[vendor_human] [product_human]" should make logical sense
+   - Names should sound natural and professional
+   - Avoid awkward splits that create meaningless vendor or product names
 
-Example 3:
-- group_identifier: "netapp|web_services"
-- most_common_left: "NetApp E-series SANtricity Web Services"
-- Algorithm: Find "web" → appears as "Web" starting at position 29 (after space)
-- Result: vendor="NetApp E-series SANtricity", product="Web Services"
+**INPUT UNDERSTANDING:**
+- title: Original full title from CPE database
+- vendor_machine: Machine-readable vendor identifier (hints for vendor boundary)
+- product_machine: Machine-readable product identifier (hints for product boundary)  
+- version, update, edition, etc.: CPE component data for context
+- all_titles: Related titles in same group for pattern recognition
+- all_versions: Version variations to help distinguish version vs product info
 
-**SPECIAL CASES:**
-
-Vendor=Product Case:
-- group_identifier: "openimageio|openimageio"
-- most_common_left: "OpenImageIO (OIIO)"
-- Result: vendor="OpenImageIO (OIIO)", product="OpenImageIO (OIIO)" (identical)
-
-**VALIDATION RULES:**
-1. Product NEVER starts at position 0
-2. Product MUST start after whitespace/punctuation  
-3. Use first valid word-boundary match
-4. Preserve exact casing from most_common_left
-5. Handle compound words correctly (don't split mid-word)
-
-**FAILURE HANDLING:**
-If no valid product position found:
-- Split at first space as fallback
-- Ensure vendor gets left part, product gets right part
-
-**OUTPUT FORMAT:**
+**OUTPUT REQUIREMENTS:**
 ```json
 [
-  {"id": "<cpe>", "vendor_name": "<vendor>", "product_name": "<product>"}
+  {
+    "id": 0,
+    "cleaned_title": "Vendor Product",
+    "vendor_human": "Vendor",
+    "product_human": "Product",
+    "confidence": 0.95,
+    "reasoning": "Brief explanation of extraction logic"
+  }
 ]
 ```
 
-**CRITICAL RULE:** The most_common_left is already properly cleaned. Simply find the product position and split there."""
+**EXAMPLES:**
 
-        user_content = f"Apply the systematic algorithm to extract vendor and product from these groups:\n\n{json.dumps(batch_input, indent=2)}"
+Input: "Apache Software Foundation Zookeeper 3.0.1"
+- vendor_machine: "apache", product_machine: "zookeeper"
+- Output: cleaned_title: "Apache Software Foundation Zookeeper", vendor_human: "Apache Software Foundation", product_human: "Zookeeper"
+
+Input: "Squeeze Project Squeeze for WordPress" 
+- vendor_machine: "squeeze_project", product_machine: "squeeze"
+- Output: cleaned_title: "Squeeze Project Squeeze", vendor_human: "Squeeze Project", product_human: "Squeeze"
+
+Input: "Microsoft Visual Studio 2017 15.9.20"
+- vendor_machine: "microsoft", product_machine: "visual_studio_2017"  
+- Output: cleaned_title: "Microsoft Visual Studio 2017", vendor_human: "Microsoft", product_human: "Visual Studio 2017"
+
+**CRITICAL SUCCESS METRICS:**
+1. Character alignment between human and machine identifiers
+2. Perfect reconstruction: cleaned_title == vendor_human + " " + product_human
+3. Natural, professional-sounding names
+4. Consistent handling of similar patterns across the dataset
+
+Be intelligent, contextual, and precise. Handle edge cases gracefully."""
+
+        user_content = f"Process these CPE entries and extract clean vendor/product names:\n\n{json.dumps(batch_data, indent=2)}"
         
         payload = {
-            "model": "gpt-5",
+            "model": "gpt-4o",
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
             ],
-            # "max_tokens": 2000,
-            "temperature": 0.0
+            "max_tokens": 4000,
+            "temperature": 0.1
         }
         
         try:
             def make_request():
-                response = requests.post(self.base_url, headers=headers, json=payload, timeout=120)
+                response = requests.post(self.base_url, headers=headers, json=payload, timeout=180)
                 response.raise_for_status()
                 return response.json()
             
             result = await asyncio.to_thread(make_request)
             content = result["choices"][0]["message"]["content"]
             
-            if content.startswith('```json'):
-                content = content[7:-3]
-            elif content.startswith('```'):
-                content = content[3:-3]
+            if not content or not content.strip():
+                logger.warning("OpenAI returned empty response")
+                return [{'vendor_human': '', 'product_human': '', 'cleaned_title': ''} for _ in items]
             
-            extracted_data = json.loads(content)
+            content = content.strip()
+            if content.startswith('```json'):
+                content = content[7:]
+            if content.startswith('```'):
+                content = content[3:]  
+            if content.endswith('```'):
+                content = content[:-3]
+            content = content.strip()
+            
+            if not content:
+                logger.warning("OpenAI response was only markdown")
+                return [{'vendor_human': '', 'product_human': '', 'cleaned_title': ''} for _ in items]
+            
+            try:
+                extracted_data = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.warning(f"OpenAI returned invalid JSON: {str(e)[:200]}")
+                return [{'vendor_human': '', 'product_human': '', 'cleaned_title': ''} for _ in items]
+            
+            if not isinstance(extracted_data, list):
+                logger.warning("OpenAI response is not a list")
+                return [{'vendor_human': '', 'product_human': '', 'cleaned_title': ''} for _ in items]
             
             results = []
-            cpe_to_index = {item['cpe']: idx for idx, item in enumerate(batch_input)}
-            
-            for item in extracted_data:
-                if isinstance(item, dict) and 'id' in item:
-                    cpe_id = item['id']
-                    if cpe_id in cpe_to_index:
-                        results.append({
-                            'vendor_name': item.get('vendor_name', '').strip(),
-                            'product_name': item.get('product_name', '').strip()
-                        })
-                    else:
-                        results.append({'vendor_name': '', 'product_name': ''})
+            for i in range(len(items)):
+                found_result = None
+                for item in extracted_data:
+                    if isinstance(item, dict) and item.get('id') == i:
+                        found_result = {
+                            'vendor_human': item.get('vendor_human', '').strip(),
+                            'product_human': item.get('product_human', '').strip(),
+                            'cleaned_title': item.get('cleaned_title', '').strip(),
+                            'confidence': item.get('confidence', 0.0),
+                            'reasoning': item.get('reasoning', '')
+                        }
+                        break
+                
+                if not found_result:
+                    results.append({
+                        'vendor_human': '', 
+                        'product_human': '', 
+                        'cleaned_title': '',
+                        'confidence': 0.0,
+                        'reasoning': 'No result found'
+                    })
                 else:
-                    results.append({'vendor_name': '', 'product_name': ''})
+                    results.append(found_result)
             
-            while len(results) < len(items):
-                results.append({'vendor_name': '', 'product_name': ''})
-            
-            return results[:len(items)]
+            return results
             
         except Exception as e:
-            logger.error(f"OpenAI batch extraction failed: {e}")
-            return [{'vendor_name': '', 'product_name': ''} for _ in items]
+            logger.error(f"OpenAI processing failed: {e}")
+            return [{'vendor_human': '', 'product_human': '', 'cleaned_title': '', 'confidence': 0.0, 'reasoning': 'API error'} for _ in items]
 
 class UnifiedCpeProcessor:
     def __init__(self, xml_file_path: str, sample_percentage: float = 0.01):
@@ -486,14 +219,13 @@ class UnifiedCpeProcessor:
             "cpe": "http://cpe.mitre.org/dictionary/2.0",
             "cpe-23": "http://scap.nist.gov/schema/cpe-extension/2.3"
         }
-        self.extractor = SystematicExtractor()
         
         openai_api_key = os.getenv("OPENAI_API_KEY")
-        if openai_api_key:
-            self.openai_extractor = OpenAIExtractor(openai_api_key)
-        else:
-            self.openai_extractor = None
-            logger.warning("OpenAI API key not found, using systematic fallback")
+        if not openai_api_key:
+            raise ValueError("OPENAI_API_KEY environment variable is required")
+        
+        self.intelligent_processor = IntelligentOpenAIProcessor(openai_api_key)
+        logger.info("Initialized with intelligent OpenAI processor")
     
     def parse_xml_file(self) -> List[Dict]:
         logger.info(f"Parsing XML file: {self.xml_file_path}")
@@ -515,16 +247,6 @@ class UnifiedCpeProcessor:
         logger.info(f"Successfully processed {len(grouped_data)} unique vendor-product combinations")
         return grouped_data
     
-    async def extract_with_openai(self, items: List[Dict]) -> List[Dict]:
-        if not self.openai_extractor:
-            return []
-        
-        try:
-            return await self.openai_extractor.extract_vendor_product_batch(items)
-        except Exception as e:
-            logger.error(f"OpenAI extraction failed: {e}")
-            return []
-    
     def group_and_process_items(self, cpe_items: List[ET.Element]) -> List[Dict]:
         raw_items = []
         for item in cpe_items:
@@ -537,7 +259,6 @@ class UnifiedCpeProcessor:
         
         logger.info(f"Parsed {len(raw_items)} raw items from XML")
         
-        # Group by (vendor_machine, product_machine)
         groups = defaultdict(list)
         for item in raw_items:
             key = (item['vendor_machine'], item['product_machine'])
@@ -546,7 +267,7 @@ class UnifiedCpeProcessor:
         logger.info(f"Created {len(groups)} unique identifier groups")
         
         final_items = []
-        batch_size = 50
+        batch_size = 25
         group_items = list(groups.items())
         
         for i in range(0, len(group_items), batch_size):
@@ -555,90 +276,79 @@ class UnifiedCpeProcessor:
             batch_metadata = []
             
             for (vendor_machine, product_machine), items in batch_groups:
-                # Extract data for systematic processing
                 titles = [item['title'] for item in items if item['title']]
-                versions = [item['version'] for item in items]
-                updates = [item['update'] for item in items]
-                editions = [item['edition'] for item in items]
-                languages = [item['language'] for item in items]
-                sw_editions = [item['sw_edition'] for item in items]
-                target_sws = [item['target_sw'] for item in items]
-                target_hws = [item['target_hw'] for item in items]
-                others = [item['other'] for item in items]
-                
-                # Get CORRECT most common left using systematic approach
-                most_common_left = self.extractor.get_most_common_left_correct(
-                    titles, versions, updates, editions, languages,
-                    sw_editions, target_sws, target_hws, others
-                )
+                versions = list(set(item['version'] for item in items if item['version'] != '-'))
                 
                 representative = items[0]
                 
                 batch_item = {
-                    'cpe': representative['cpe'],
                     'title': titles[0] if titles else "",
                     'vendor_machine': vendor_machine,
                     'product_machine': product_machine,
                     'version': representative['version'],
-                    'most_common_left': most_common_left,
-                    'group_size': len(items),
-                    'sample_titles': titles[:3]  # Sample for AI context
+                    'update': representative['update'],
+                    'edition': representative['edition'],
+                    'language': representative['language'],
+                    'sw_edition': representative['sw_edition'],
+                    'target_sw': representative['target_sw'],
+                    'target_hw': representative['target_hw'],
+                    'other': representative['other'],
+                    'all_titles': titles[:5],
+                    'all_versions': versions[:5]
                 }
                 
                 batch_items_for_ai.append(batch_item)
                 batch_metadata.append({
                     'items': items,
-                    'titles': titles,
                     'vendor_machine': vendor_machine,
                     'product_machine': product_machine,
-                    'group_size': len(items),
-                    'most_common_left': most_common_left,
-                    'representative': representative,
-                    'group_identifier': f"{vendor_machine}|{product_machine}"
+                    'group_identifier': f"{vendor_machine}|{product_machine}",
+                    'representative': representative
                 })
             
             if batch_items_for_ai:
                 logger.info(f"Processing batch {i//batch_size + 1}/{(len(group_items) + batch_size - 1)//batch_size} with {len(batch_items_for_ai)} groups")
                 
-                # Try OpenAI first
-                extraction_results = asyncio.run(self.extract_with_openai(batch_items_for_ai))
+                extraction_results = asyncio.run(self.intelligent_processor.process_title_batch(batch_items_for_ai))
                 
                 for idx, metadata in enumerate(batch_metadata):
-                    # Use OpenAI result if available and valid
-                    if (idx < len(extraction_results) and 
-                        extraction_results[idx] and 
-                        extraction_results[idx]['vendor_name'] and 
-                        extraction_results[idx]['product_name']):
-                        vendor_human = extraction_results[idx]['vendor_name']
-                        product_human = extraction_results[idx]['product_name']
-                    else:
-                        # Use systematic fallback
-                        vendor_human, product_human = self.extractor.split_vendor_product_systematic(
-                            metadata['most_common_left'], 
-                            metadata['vendor_machine'], 
-                            metadata['product_machine']
+                    if (idx < len(extraction_results) and extraction_results[idx] and 
+                        extraction_results[idx]['vendor_human'] and extraction_results[idx]['product_human']):
+                        
+                        result = extraction_results[idx]
+                        vendor_human = result['vendor_human']
+                        product_human = result['product_human']
+                        cleaned_title = result['cleaned_title']
+                        confidence = result['confidence']
+                        reasoning = result['reasoning']
+                        
+                        validation = self.validate_extraction(
+                            vendor_human, product_human, cleaned_title,
+                            metadata['vendor_machine'], metadata['product_machine']
                         )
+                        
+                        logger.info(f"Processed group {metadata['group_identifier']}: {vendor_human} | {product_human} (confidence: {confidence:.2f}, valid: {validation['is_valid']})")
+                        
+                    else:
+                        vendor_human = metadata['vendor_machine'].replace('_', ' ').title()
+                        product_human = metadata['product_machine'].replace('_', ' ').title()
+                        cleaned_title = f"{vendor_human} {product_human}"
+                        confidence = 0.0
+                        reasoning = "Fallback due to AI processing failure"
+                        validation = {'is_valid': False, 'issues': ['AI processing failed']}
+                        logger.warning(f"AI processing failed for group {metadata['group_identifier']}, using fallback")
                     
-                    # Perform systematic validation
-                    rep = metadata['representative']
-                    validation = self.extractor.validate_systematic(
-                        metadata['titles'][0] if metadata['titles'] else "",
-                        vendor_human, product_human,
-                        metadata['vendor_machine'], metadata['product_machine'],
-                        rep['version'], rep['update'], rep['edition'], rep['language'],
-                        rep['sw_edition'], rep['target_sw'], rep['target_hw'], rep['other']
-                    )
-                    
-                    # Collect all data from group
                     all_cpes = [item['cpe'] for item in metadata['items']]
                     all_versions = list(set(item['version'] for item in metadata['items'] if item['version'] != "-"))
                     all_references = []
                     for item in metadata['items']:
                         all_references.extend(item.get('references', []))
                     
+                    rep = metadata['representative']
+                    
                     final_item = {
                         "cpe": " | ".join(all_cpes),
-                        "Title": metadata['titles'][0] if metadata['titles'] else "",
+                        "Title": batch_items_for_ai[idx]['title'] if idx < len(batch_items_for_ai) else "",
                         "vendor_human": vendor_human,
                         "product_human": product_human,
                         "Validation Product Name": validation['is_valid'],
@@ -650,23 +360,14 @@ class UnifiedCpeProcessor:
                         "editions": [rep['edition']] if rep['edition'] != "*" else ["*"],
                         "languages": [rep['language']] if rep['language'] != "*" else ["*"],
                         "references": list(set(all_references)),
-                        "category": self.get_corrected_category(rep['part'], metadata['product_machine'], metadata['titles'][0] if metadata['titles'] else ""),
+                        "category": self.get_corrected_category(rep['part'], metadata['product_machine'], batch_items_for_ai[idx]['title'] if idx < len(batch_items_for_ai) else ""),
                         "Part_Type": rep['part'].get_abbreviation(),
                         "Vendor_Machine": metadata['vendor_machine'],
                         "Product_Machine": metadata['product_machine'],
                         "Group_Identifier": metadata['group_identifier'],
-                        "Validation_Vendor_Start": validation['vendor_start_match'],
-                        "Validation_Vendor_End": validation['vendor_end_match'],
-                        "Validation_Product_Start": validation['product_start_match'],
-                        "Validation_Product_End": validation['product_end_match'],
-                        "Validation_Title_Full": metadata['titles'][0] if metadata['titles'] else "",
-                        "Validation_Vendor": vendor_human,
-                        "Validation_Product": product_human,
-                        "Validation_Final": validation['is_valid'],
-                        "Group_Size": metadata['group_size'],
-                        "Vendor_Similarity": validation['vendor_similarity'],
-                        "Product_Similarity": validation['product_similarity'],
-                        "Most_Common_Left": metadata['most_common_left'],
+                        "AI_Confidence": confidence,
+                        "AI_Reasoning": reasoning,
+                        "Cleaned_Title": cleaned_title,
                         "Validation_Issues": "; ".join(validation['issues'])
                     }
                     
@@ -674,6 +375,54 @@ class UnifiedCpeProcessor:
         
         logger.info(f"Successfully processed {len(final_items)} final items from {len(groups)} groups")
         return final_items
+    
+    def validate_extraction(self, vendor_human: str, product_human: str, cleaned_title: str,
+                          vendor_machine: str, product_machine: str) -> Dict:
+        issues = []
+        
+        if not vendor_human or not product_human or not cleaned_title:
+            issues.append("Missing required fields")
+            return {'is_valid': False, 'issues': issues}
+        
+        # Special handling for vendor=product machine cases
+        if vendor_machine == product_machine:
+            # For same machines, both names should be identical and equal cleaned_title
+            if vendor_human != product_human:
+                issues.append("Vendor and product should be identical for same machines")
+            if vendor_human != cleaned_title:
+                issues.append("Names should equal cleaned title for same machines")
+        else:
+            # For different machines, standard reconstruction
+            reconstructed = f"{vendor_human} {product_human}".strip()
+            if reconstructed != cleaned_title:
+                issues.append("Reconstruction mismatch")
+        
+        def clean_for_alignment(s: str) -> str:
+            return re.sub(r'[^a-zA-Z0-9]', '', s.lower())
+        
+        vh_clean = clean_for_alignment(vendor_human)
+        vm_clean = clean_for_alignment(vendor_machine)
+        ph_clean = clean_for_alignment(product_human)
+        pm_clean = clean_for_alignment(product_machine)
+        
+        # Character alignment validation (more lenient for complex cases)
+        if vendor_machine == product_machine:
+            # For same machines, validate against machine identifier
+            if vh_clean and vm_clean:
+                if not (vh_clean.startswith(vm_clean[0]) or vm_clean.startswith(vh_clean[0])):
+                    issues.append("Character alignment mismatch")
+        else:
+            # For different machines, validate each separately with more flexibility
+            if vh_clean and vm_clean and len(vh_clean) > 0 and len(vm_clean) > 0:
+                if vh_clean[0] != vm_clean[0]:
+                    issues.append("Vendor start character mismatch")
+            
+            if ph_clean and pm_clean and len(ph_clean) > 0 and len(pm_clean) > 0:
+                if ph_clean[0] != pm_clean[0]:
+                    issues.append("Product start character mismatch")
+        
+        is_valid = len(issues) == 0
+        return {'is_valid': is_valid, 'issues': issues}
     
     def parse_single_item(self, cpe_item: ET.Element) -> Optional[Dict]:
         try:
@@ -762,12 +511,8 @@ class UnifiedCpeProcessor:
             "cpe", "Title", "vendor_human", "product_human", "Validation Product Name",
             "part", "target_softwares", "target_hardwares", "versions", "updates",
             "editions", "languages", "references", "category", "Part_Type", 
-            "Vendor_Machine", "Product_Machine", "Group_Identifier", 
-            "Validation_Vendor_Start", "Validation_Vendor_End", 
-            "Validation_Product_Start", "Validation_Product_End",
-            "Validation_Title_Full", "Validation_Vendor", "Validation_Product", 
-            "Validation_Final", "Group_Size", "Vendor_Similarity", "Product_Similarity", 
-            "Most_Common_Left", "Validation_Issues"
+            "Vendor_Machine", "Product_Machine", "Group_Identifier",
+            "AI_Confidence", "AI_Reasoning", "Cleaned_Title", "Validation_Issues"
         ]
         df = pd.DataFrame(data)
         df = df.reindex(columns=columns, fill_value="")
@@ -783,9 +528,12 @@ class UnifiedCpeProcessor:
         valid_sum = df["Validation Product Name"].sum() if "Validation Product Name" in df.columns else 0
         logger.info(f"Validation passed: {valid_sum}")
         logger.info(f"Validation failed: {len(df) - valid_sum}")
+        
+        high_confidence = df[df["AI_Confidence"] >= 0.8].shape[0] if "AI_Confidence" in df.columns else 0
+        logger.info(f"High confidence extractions (>=0.8): {high_confidence}")
     
     def run(self, output_file: str):
-        logger.info("Starting unified CPE processing")
+        logger.info("Starting intelligent OpenAI-driven CPE processing")
         if not Path(self.xml_file_path).exists():
             raise FileNotFoundError(f"XML file not found: {self.xml_file_path}")
         
