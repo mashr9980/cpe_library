@@ -4,9 +4,8 @@ import pandas as pd
 import logging
 import random
 import asyncio
-import json
 import re
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from pathlib import Path
 from collections import defaultdict, Counter
 
@@ -19,7 +18,7 @@ from parser.ai_corrector import OpenAICorrector
 logger = logging.getLogger(__name__)
 
 class RuleBasedCpeProcessor:
-    def _init_(self, xml_file_path: str, sample_percentage: float = 0.01):
+    def __init__(self, xml_file_path: str, sample_percentage: float = 0.01):
         self.xml_file_path = xml_file_path
         self.sample_percentage = sample_percentage
         self.namespaces = {
@@ -78,7 +77,7 @@ class RuleBasedCpeProcessor:
         exceptions_for_ai = []
         
         for (vendor_machine, product_machine), items in groups.items():
-            # Clean all titles in the group by removing versions/components
+            # Clean all titles by removing versions and components
             cleaned_titles = []
             for item in items:
                 cleaned_title = self.clean_title_remove_versions(item['title'], item)
@@ -97,14 +96,20 @@ class RuleBasedCpeProcessor:
                 representative_title, vendor_human, product_machine
             )
             
-            # Handle vendor=product exception
-            if vendor_machine.replace('_', '').replace('-', '').lower() == product_machine.replace('_', '').replace('-', '').lower():
+            # Handle vendor=product machine case
+            if self.is_same_identifier(vendor_machine, product_machine):
                 if vendor_human.lower() == product_human.lower():
-                    # Try to differentiate by finding more specific product info
-                    product_human = self.differentiate_vendor_product(representative_title, vendor_human, product_machine)
+                    product_human = self.differentiate_vendor_product(
+                        representative_title, vendor_human, product_machine
+                    )
+            
+            # Handle incomplete product names (Project/Foundation cases)
+            product_human = self.handle_incomplete_product_names(
+                vendor_human, product_human, product_machine, representative_title
+            )
             
             # STEP 4: Validate extraction
-            validation_result = self.validate_requirements(
+            validation_result = self.validate_extraction_requirements(
                 vendor_human, product_human, vendor_machine, product_machine, 
                 representative_title, cleaned_titles
             )
@@ -129,7 +134,7 @@ class RuleBasedCpeProcessor:
                 })
                 logger.debug(f"Exception for AI: {vendor_machine}|{product_machine} - {validation_result['issues']}")
         
-        # Process exceptions with AI
+        # Process exceptions with AI if available
         if exceptions_for_ai and self.ai_corrector:
             logger.info(f"Processing {len(exceptions_for_ai)} exceptions with AI")
             ai_corrected = self.process_exceptions_with_ai(exceptions_for_ai)
@@ -165,7 +170,6 @@ class RuleBasedCpeProcessor:
         # Remove explicit version from CPE
         version = item.get('version', '*')
         if version and version not in ('*', '-'):
-            # Escape special regex characters and remove version
             version_escaped = re.escape(version)
             cleaned = re.sub(rf'\b{version_escaped}\b.*$', '', cleaned, flags=re.IGNORECASE).strip()
         
@@ -186,28 +190,27 @@ class RuleBasedCpeProcessor:
         
         # Remove common version patterns
         version_patterns = [
-            r'\s+\d+\.\d+[\.\d]*(?:[a-zA-Z]\d*)?(?:\s*(?:RC|Beta|Alpha|Build)\s*\d*)?.*$',
+            r'\s+\d+\.\d+[\.\d]*(?:[a-zA-Z]\d*)?(?:\s*(?:RC|Beta|Alpha|Build|Release\s+Candidate)\s*\d*)?.*$',
             r'\s+v\d+[\.\d\w\-]*.*$',
             r'\s+\d{4}(?:\.\d+)*.*$',
             r'\s+(?:for|on)\s+\w+.*$',
-            r'\s+(?:build|beta|alpha|rc|release\s+candidate)\b.*$',
+            r'\s+(?:build|beta|alpha|rc)\b.*$',
         ]
         
         for pattern in version_patterns:
             new_cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE).strip()
-            if new_cleaned and len(new_cleaned) >= len(cleaned) * 0.5:  # Don't remove too much
+            if new_cleaned and len(new_cleaned) >= len(cleaned) * 0.5:
                 cleaned = new_cleaned
                 break
         
         return cleaned
-
+    
     def get_most_common_left_part(self, titles: List[str], vendor_machine: str) -> str:
-        """'Get most common part from left until version"""
+        """Get most common part from left until version"""
         if not titles:
             return self.humanize_machine_identifier(vendor_machine)
         
         if len(titles) == 1:
-            # Single title: split intelligently based on machine identifier
             return self.extract_vendor_from_single_title(titles[0], vendor_machine)
         
         # Multiple titles: find common left prefix
@@ -227,24 +230,148 @@ class RuleBasedCpeProcessor:
                 break
         
         if common_prefix:
-            # Validate common prefix makes sense as vendor
             vendor_candidate = ' '.join(common_prefix)
             if self.validate_vendor_candidate(vendor_candidate, vendor_machine):
                 return vendor_candidate
         
-        # Fallback: most frequent first words
+        # Fallback: most frequent first words with extension
         first_words = [words[0] for words in all_words]
         word_counts = Counter(word.lower() for word in first_words)
         most_common_lower = word_counts.most_common(1)[0][0]
         
-        # Return original case of most common word
         for word in first_words:
             if word.lower() == most_common_lower:
-                # Try to extend with additional common words
                 extended_vendor = self.extend_vendor_name(word, titles, vendor_machine)
                 return extended_vendor
         
         return self.humanize_machine_identifier(vendor_machine)
+    
+    def extract_vendor_from_single_title(self, title: str, vendor_machine: str) -> str:
+        """Extract vendor from single title using machine identifier hints"""
+        words = title.split()
+        if not words:
+            return self.humanize_machine_identifier(vendor_machine)
+        
+        vendor_tokens = re.split(r'[_\-]', vendor_machine.lower())
+        vendor_tokens = [t for t in vendor_tokens if t and len(t) > 1]
+        
+        if not vendor_tokens:
+            return words[0]
+        
+        # Find best match length for vendor
+        best_length = 1
+        best_score = 0
+        
+        for length in range(1, min(len(words) + 1, 5)):
+            candidate = ' '.join(words[:length])
+            score = self.calculate_vendor_match_score(candidate.lower(), vendor_tokens)
+            if score > best_score:
+                best_score = score
+                best_length = length
+        
+        # Ensure we don't take too much (leave something for product)
+        max_length = max(1, len(words) - 1)
+        final_length = min(best_length, max_length)
+        
+        return ' '.join(words[:final_length])
+    
+    def extract_product_after_vendor_space(self, title: str, vendor: str, product_machine: str) -> str:
+        """Product must start after a space, not mid-word"""
+        if not title or not vendor:
+            return self.humanize_machine_identifier(product_machine)
+        
+        title_lower = title.lower()
+        vendor_lower = vendor.lower()
+        
+        vendor_pos = title_lower.find(vendor_lower)
+        if vendor_pos == -1:
+            return self.humanize_machine_identifier(product_machine)
+        
+        after_vendor_pos = vendor_pos + len(vendor)
+        
+        # Ensure we're at word boundary (space or end of string)
+        if after_vendor_pos < len(title) and not title[after_vendor_pos].isspace():
+            return self.humanize_machine_identifier(product_machine)
+        
+        # Get text after vendor
+        remaining = title[after_vendor_pos:].strip()
+        if not remaining:
+            return self.humanize_machine_identifier(product_machine)
+        
+        # Clean product name
+        product_name = self.clean_product_name_strict(remaining, product_machine)
+        
+        return product_name if product_name else self.humanize_machine_identifier(product_machine)
+    
+    def clean_product_name_strict(self, product_text: str, product_machine: str) -> str:
+        """Clean product name according to requirements"""
+        if not product_text:
+            return ""
+        
+        cleaned = product_text.strip()
+        
+        # Remove target software indicators (major requirement)
+        target_patterns = [
+            r'\s+for\s+wordpress.*$',
+            r'\s+for\s+windows.*$',
+            r'\s+for\s+linux.*$',
+            r'\s+for\s+android.*$',
+            r'\s+for\s+ios.*$',
+            r'\s+for\s+mac\s+os.*$',
+            r'\s+for\s+node\.js.*$',
+            r'\s+for\s+php.*$',
+            r'\s+for\s+java.*$',
+            r'\s+for\s+confluence.*$',
+            r'\s+for\s+jenkins.*$',
+            r'\s+for\s+\w+.*$',
+        ]
+        
+        for pattern in target_patterns:
+            new_cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+            if new_cleaned != cleaned:
+                cleaned = new_cleaned.strip()
+                break
+        
+        # Remove edition info
+        edition_patterns = [
+            r'\s+(?:pro|professional|enterprise|ultimate|lite|community|premium|standard|free|trial)\s+edition.*$',
+            r'\s+(?:pro|professional|enterprise|ultimate|lite|community|premium|standard|free|trial)(?:\s|$)',
+        ]
+        
+        for pattern in edition_patterns:
+            new_cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+            if new_cleaned != cleaned and len(new_cleaned.strip()) > 0:
+                cleaned = new_cleaned.strip()
+                break
+        
+        # Remove version info
+        version_patterns = [
+            r'\s+\d+\.\d+[\.\d]*.*$',
+            r'\s+v\d+[\.\d\w\-]*.*$',
+            r'\s+\d{4}[\.\d]*.*$',
+            r'\s+(?:build|beta|alpha|rc|release\s+candidate)\b.*$',
+        ]
+        
+        for pattern in version_patterns:
+            new_cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+            if new_cleaned != cleaned and len(new_cleaned.strip()) > 2:
+                cleaned = new_cleaned.strip()
+                break
+        
+        # Remove excessive parenthetical descriptions
+        if '(' in cleaned and len(cleaned) > 40:
+            paren_removed = re.sub(r'\s*\([^)]*\)\s*', ' ', cleaned).strip()
+            paren_removed = re.sub(r'\s+', ' ', paren_removed)
+            if len(paren_removed) > 3:
+                cleaned = paren_removed
+        
+        return cleaned.strip()
+    
+    def is_same_identifier(self, vendor_machine: str, product_machine: str) -> bool:
+        """Check if vendor and product machine identifiers are essentially the same"""
+        v_clean = vendor_machine.replace('_', '').replace('-', '').lower()
+        p_clean = product_machine.replace('_', '').replace('-', '').lower()
+        return v_clean == p_clean
     
     def differentiate_vendor_product(self, title: str, vendor: str, product_machine: str) -> str:
         """Handle case where vendor=product machine identifiers"""
@@ -261,13 +388,33 @@ class RuleBasedCpeProcessor:
             if product_extension and len(product_extension) > 2:
                 return product_extension
         
-        # Fallback to humanized machine identifier
         return self.humanize_machine_identifier(product_machine)
     
-    def validate_requirements(self, vendor_human: str, product_human: str, 
-                               vendor_machine: str, product_machine: str, 
-                               title: str, cleaned_titles: List[str]) -> Dict:
-        """Validate according to 's specific requirements"""
+    def handle_incomplete_product_names(self, vendor_human: str, product_human: str, 
+                                      product_machine: str, title: str) -> str:
+        """Fix incomplete product names for Project/Foundation cases"""
+        # Check if vendor contains "Project" or "Foundation" but product doesn't
+        vendor_lower = vendor_human.lower()
+        product_lower = product_human.lower()
+        
+        organizational_suffixes = ['project', 'foundation', 'organization', 'org', 'team', 'group']
+        
+        # If vendor has org suffix but product is just the base name
+        for suffix in organizational_suffixes:
+            if suffix in vendor_lower and suffix not in product_lower:
+                # Check if the full product name should include the organizational context
+                machine_tokens = re.split(r'[_\-]', product_machine.lower())
+                if suffix in machine_tokens or 'project' in machine_tokens:
+                    # The product should probably include the project/foundation context
+                    if f"{product_human} {suffix.title()}" in title:
+                        return f"{product_human} {suffix.title()}"
+        
+        return product_human
+    
+    def validate_extraction_requirements(self, vendor_human: str, product_human: str, 
+                                       vendor_machine: str, product_machine: str, 
+                                       title: str, cleaned_titles: List[str]) -> Dict:
+        """Validate according to client requirements"""
         issues = []
         confidence = 1.0
         
@@ -275,65 +422,63 @@ class RuleBasedCpeProcessor:
         if not vendor_human or not product_human:
             return {'is_valid': False, 'issues': ['Missing vendor or product'], 'confidence': 0.0}
         
-        # Character alignment validation ('s requirement)
+        # Character alignment validation
         vh_clean = re.sub(r'[^a-z0-9]', '', vendor_human.lower())
         vm_clean = re.sub(r'[^a-z0-9]', '', vendor_machine.lower())
         ph_clean = re.sub(r'[^a-z0-9]', '', product_human.lower())
         pm_clean = re.sub(r'[^a-z0-9]', '', product_machine.lower())
         
-        # Start character alignment
+        # Start/end character alignment
         if vh_clean and vm_clean and vh_clean[0] != vm_clean[0]:
             issues.append("Vendor start character mismatch")
-            confidence -= 0.3
+            confidence -= 0.25
         
         if ph_clean and pm_clean and ph_clean[0] != pm_clean[0]:
             issues.append("Product start character mismatch")
-            confidence -= 0.3
+            confidence -= 0.25
         
-        # End character alignment
         if vh_clean and vm_clean and vh_clean[-1] != vm_clean[-1]:
             issues.append("Vendor end character mismatch")
-            confidence -= 0.3
+            confidence -= 0.25
         
         if ph_clean and pm_clean and ph_clean[-1] != pm_clean[-1]:
             issues.append("Product end character mismatch")
-            confidence -= 0.3
+            confidence -= 0.25
         
         # Similarity validation
         vendor_similarity = self.jaro_winkler_similarity(vendor_human.lower(), vendor_machine.lower())
         product_similarity = self.jaro_winkler_similarity(product_human.lower(), product_machine.lower())
         
-        if vendor_similarity < 0.6:
+        if vendor_similarity < 0.65:
             issues.append(f"Low vendor similarity: {vendor_similarity:.2f}")
-            confidence -= 0.4
+            confidence -= 0.3
         
-        if product_similarity < 0.6:
+        if product_similarity < 0.65:
             issues.append(f"Low product similarity: {product_similarity:.2f}")
-            confidence -= 0.4
+            confidence -= 0.3
         
-        # Product starts after space validation ('s major requirement)
+        # Product starts after space validation
         if not self.validate_product_after_space_strict(title, vendor_human, product_human):
             issues.append("Product doesn't start after space")
-            confidence -= 0.5
+            confidence -= 0.4
         
         # Title reconstruction validation
         reconstructed = f"{vendor_human} {product_human}".strip()
         if not any(reconstructed.lower() in t.lower() for t in [title] + cleaned_titles):
             issues.append("Reconstruction not found in title")
-            confidence -= 0.2
+            confidence -= 0.15
         
-        # Check for version in product name ('s complaint)
+        # Check for prohibited content in product name
         if re.search(r'\d+\.\d+', product_human):
             issues.append("Version found in product name")
             confidence -= 0.4
         
-        # Check for target software in product name ('s major complaint)
         if re.search(r'for\s+(wordpress|windows|linux|android|ios|mac|node\.js|php|java)', product_human, re.IGNORECASE):
             issues.append("Target software found in product name")
             confidence -= 0.5
         
-        # Strict validation threshold
-        is_valid = len(issues) == 0 and confidence >= 0.8
+        # Strict validation: no issues allowed for rule-based success
+        is_valid = len(issues) == 0 and confidence >= 0.85
         
         return {
             'is_valid': is_valid,
@@ -344,7 +489,7 @@ class RuleBasedCpeProcessor:
         }
     
     def validate_product_after_space_strict(self, title: str, vendor: str, product: str) -> bool:
-        """Strict validation that product starts after a space ('s requirement)"""
+        """Validate that product starts after a space"""
         if not all([title, vendor, product]):
             return False
         
@@ -403,188 +548,6 @@ class RuleBasedCpeProcessor:
         similarity = self.jaro_winkler_similarity(vendor.lower(), vendor_machine.lower())
         return similarity >= 0.5
     
-    def extract_product_after_vendor_space(self, title: str, vendor: str, product_machine: str) -> str:
-        """'S REQUIREMENT: Product must start after a space, not mid-word"""
-        if not title or not vendor:
-            return self.humanize_machine_identifier(product_machine)
-        
-        # Find vendor position in title
-        title_lower = title.lower()
-        vendor_lower = vendor.lower()
-        
-        vendor_pos = title_lower.find(vendor_lower)
-        if vendor_pos == -1:
-            # Vendor not found, extract from machine identifier
-            return self.humanize_machine_identifier(product_machine)
-        
-        # Position after vendor
-        after_vendor_pos = vendor_pos + len(vendor)
-        
-        # Ensure we're at word boundary (space or end of string)
-        if after_vendor_pos < len(title) and not title[after_vendor_pos].isspace():
-            # Not at word boundary, vendor might be partial match
-            return self.humanize_machine_identifier(product_machine)
-        
-        # Get text after vendor
-        remaining = title[after_vendor_pos:].strip()
-        if not remaining:
-            return self.humanize_machine_identifier(product_machine)
-        
-        # Clean product name
-        product_name = self.clean_product_name_strict(remaining, product_machine)
-        
-        return product_name if product_name else self.humanize_machine_identifier(product_machine)
-    
-    def clean_product_name_strict(self, product_text: str, product_machine: str) -> str:
-        """Clean product name according to 's requirements"""
-        if not product_text:
-            return ""
-        
-        cleaned = product_text.strip()
-        
-        # Remove target software indicators
-        target_patterns = [
-            r'\s+for\s+wordpress.*$',
-            r'\s+for\s+windows.*$',
-            r'\s+for\s+linux.*$',
-            r'\s+for\s+android.*$',
-            r'\s+for\s+ios.*$',
-            r'\s+for\s+mac\s+os.*$',
-            r'\s+for\s+node\.js.*$',
-            r'\s+for\s+php.*$',
-            r'\s+for\s+java.*$',
-            r'\s+for\s+\w+.*$',  # Generic "for X"
-        ]
-        
-        for pattern in target_patterns:
-            new_cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
-            if new_cleaned != cleaned:
-                cleaned = new_cleaned.strip()
-                break
-        
-        # Remove edition info
-        edition_patterns = [
-            r'\s+(?:pro|professional|enterprise|ultimate|lite|community|premium|standard|free|trial)\s+edition.*$',
-            r'\s+(?:pro|professional|enterprise|ultimate|lite|community|premium|standard|free|trial).*$',
-        ]
-        
-        for pattern in edition_patterns:
-            new_cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
-            if new_cleaned != cleaned and len(new_cleaned.strip()) > 0:
-                cleaned = new_cleaned.strip()
-                break
-        
-        # Remove version info ('s complaint)
-        version_patterns = [
-            r'\s+\d+\.\d+[\.\d]*.*$',
-            r'\s+v\d+[\.\d\w\-]*.*$',
-            r'\s+\d{4}[\.\d]*.*$',
-            r'\s+(?:build|beta|alpha|rc|release\s+candidate)\b.*$',
-        ]
-        
-        for pattern in version_patterns:
-            new_cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
-            if new_cleaned != cleaned and len(new_cleaned.strip()) > 2:
-                cleaned = new_cleaned.strip()
-                break
-        
-        # Remove parenthetical descriptions if they make product too long
-        if '(' in cleaned and len(cleaned) > 30:
-            paren_removed = re.sub(r'\s*\([^)]*\)\s*', ' ', cleaned).strip()
-            paren_removed = re.sub(r'\s+', ' ', paren_removed)
-            if len(paren_removed) > 3:
-                cleaned = paren_removed
-        
-        return cleaned.strip()
-    
-    def extract_most_common_left(self, items: List[Dict], vendor_machine: str, product_machine: str) -> str:
-        cleaned_titles = []
-        for item in items:
-            title = item['title']
-            if not title:
-                continue
-                
-            cleaned = self.remove_version_from_title(title, item)
-            if cleaned:
-                cleaned_titles.append(cleaned)
-        
-        if not cleaned_titles:
-            return self.humanize_machine_identifier(vendor_machine)
-        
-        if len(cleaned_titles) == 1:
-            return self.extract_vendor_from_single_title(cleaned_titles[0], vendor_machine, product_machine)
-        
-        return self.find_common_left_part(cleaned_titles, vendor_machine)
-    
-    def remove_version_from_title(self, title: str, item: Dict) -> str:
-        version = item.get('version', '*')
-        update = item.get('update', '*')
-        edition = item.get('edition', '*')
-        sw_edition = item.get('sw_edition', '*')
-        target_sw = item.get('target_sw', '*')
-        target_hw = item.get('target_hw', '*')
-        other = item.get('other', '*')
-        
-        cleaned_title = title
-        
-        if version and version != '*' and version != '-':
-            version_escaped = re.escape(version)
-            cleaned_title = re.sub(rf'\b{version_escaped}\b.*$', '', cleaned_title, flags=re.IGNORECASE)
-        
-        if not version or version in ('*', '-'):
-            components_to_remove = [update, edition, sw_edition, target_sw, target_hw, other]
-            for component in components_to_remove:
-                if component and component not in ('*', '-'):
-                    comp_escaped = re.escape(component)
-                    cleaned_title = re.sub(rf'\b{comp_escaped}\b.*$', '', cleaned_title, flags=re.IGNORECASE)
-                    break
-        
-        version_patterns = [
-            r'\b\d+\.\d+[\.\d]*(?:\.\d+)*(?:[a-zA-Z]\d*)?(?:\s*(?:RC|Beta|Alpha|Build)\s*\d*)?.*$',
-            r'\bv?\d+[\.\d\w\-]*(?:\s+.*)?$',
-            r'\b\d{4}[\.\d]*(?:\s+.*)?$',
-            r'\s+(?:for|on)\s+\w+.*$',
-            r'\s+(?:build|beta|alpha|rc)\b.*$',
-            r'\s+(?:pro|professional|enterprise|ultimate|lite|community|premium|edition|free|trial|standard)(?:\s+edition)?.*$'
-        ]
-        
-        for pattern in version_patterns:
-            new_cleaned = re.sub(pattern, '', cleaned_title, flags=re.IGNORECASE)
-            if new_cleaned != cleaned_title:
-                cleaned_title = new_cleaned
-                break
-        
-        return cleaned_title.strip()
-    
-    def extract_vendor_from_single_title(self, title: str, vendor_machine: str) -> str:
-        """Extract vendor from single title using machine identifier hints"""
-        words = title.split()
-        if not words:
-            return self.humanize_machine_identifier(vendor_machine)
-        
-        vendor_tokens = re.split(r'[_\-]', vendor_machine.lower())
-        vendor_tokens = [t for t in vendor_tokens if t and len(t) > 1]
-        
-        if not vendor_tokens:
-            return words[0]
-        
-        # Find best match length for vendor
-        best_length = 1
-        best_score = 0
-        
-        for length in range(1, min(len(words) + 1, 5)):
-            candidate = ' '.join(words[:length])
-            score = self.calculate_vendor_match_score(candidate.lower(), vendor_tokens)
-            if score > best_score:
-                best_score = score
-                best_length = length
-        
-        # Ensure we don't take too much (leave something for product)
-        max_length = max(1, len(words) - 1)
-        final_length = min(best_length, max_length)
-        
-        return ' '.join(words[:final_length])
-    
     def calculate_vendor_match_score(self, candidate: str, vendor_tokens: List[str]) -> float:
         """Calculate how well candidate matches vendor tokens"""
         if not candidate or not vendor_tokens:
@@ -603,128 +566,8 @@ class RuleBasedCpeProcessor:
         
         return matches / len(vendor_tokens)
     
-    def find_common_left_part(self, titles: List[str], vendor_machine: str) -> str:
-        all_tokens = []
-        for title in titles:
-            tokens = title.split()
-            if tokens:
-                all_tokens.append(tokens)
-        
-        if not all_tokens:
-            return self.humanize_machine_identifier(vendor_machine)
-        
-        min_length = min(len(tokens) for tokens in all_tokens)
-        common_tokens = []
-        
-        for i in range(min_length):
-            first_token = all_tokens[0][i].lower()
-            if all(tokens[i].lower() == first_token for tokens in all_tokens):
-                common_tokens.append(all_tokens[0][i])
-            else:
-                break
-        
-        if common_tokens:
-            return ' '.join(common_tokens)
-        
-        first_tokens = [tokens[0] for tokens in all_tokens if tokens]
-        if first_tokens:
-            token_counts = Counter(token.lower() for token in first_tokens)
-            most_common_lower = token_counts.most_common(1)[0][0]
-            for token in first_tokens:
-                if token.lower() == most_common_lower:
-                    return token
-        
-        return self.humanize_machine_identifier(vendor_machine)
-    
-    def extract_product_name(self, title: str, vendor_human: str, product_machine: str) -> str:
-        if not title or not vendor_human:
-            return self.humanize_machine_identifier(product_machine)
-        
-        vendor_lower = vendor_human.lower()
-        title_lower = title.lower()
-        
-        vendor_end_pos = title_lower.find(vendor_lower)
-        if vendor_end_pos == -1:
-            return self.find_product_by_machine_identifier(title, product_machine)
-        
-        vendor_end_pos += len(vendor_human)
-        remaining_title = title[vendor_end_pos:].lstrip()
-        
-        if not remaining_title:
-            return self.humanize_machine_identifier(product_machine)
-        
-        product_name = self.clean_product_name(remaining_title)
-        
-        if vendor_human.lower() == product_name.lower():
-            return self.handle_vendor_equals_product(title, vendor_human, product_machine)
-        
-        return product_name if product_name else self.humanize_machine_identifier(product_machine)
-    
-    def find_product_by_machine_identifier(self, title: str, product_machine: str) -> str:
-        product_tokens = re.split(r'[_\-]', product_machine.lower())
-        product_tokens = [t for t in product_tokens if t and len(t) > 1]
-        
-        if not product_tokens:
-            return self.humanize_machine_identifier(product_machine)
-        
-        title_lower = title.lower()
-        best_match = None
-        best_score = 0
-        
-        words = title.split()
-        for i in range(len(words)):
-            for j in range(i + 1, len(words) + 1):
-                candidate = ' '.join(words[i:j])
-                if i == 0:
-                    continue
-                
-                score = self.calculate_token_overlap(candidate.lower(), product_tokens)
-                if score > best_score and score > 0.3:
-                    best_score = score
-                    best_match = candidate
-        
-        return best_match if best_match else self.humanize_machine_identifier(product_machine)
-    
-    def clean_product_name(self, product_text: str) -> str:
-        cleaned = product_text.strip()
-        
-        version_patterns = [
-            r'\s+\d+\.\d+[\.\d]*(?:\.\d+)*(?:[a-zA-Z]\d*)?(?:\s*(?:RC|Beta|Alpha|Build)\s*\d*)?.*$',
-            r'\s+v?\d+[\.\d\w\-]*$',
-            r'\s+\d{4}[\.\d]*$',
-            r'\s+(?:for|on)\s+\w+.*$',
-            r'\s+(?:build|beta|alpha|rc)\b.*$'
-        ]
-        
-        for pattern in version_patterns:
-            new_cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
-            if new_cleaned != cleaned:
-                cleaned = new_cleaned
-                break
-        
-        return cleaned.strip()
-    
-    def handle_vendor_equals_product(self, title: str, vendor_human: str, product_machine: str) -> str:
-        words = title.split()
-        vendor_words = vendor_human.split()
-        
-        if len(words) > len(vendor_words):
-            remaining_words = words[len(vendor_words):]
-            if remaining_words:
-                product_candidate = ' '.join(remaining_words)
-                return self.clean_product_name(product_candidate)
-        
-        return self.humanize_machine_identifier(product_machine)
-    
-    def calculate_token_overlap(self, text: str, tokens: List[str]) -> float:
-        text_tokens = re.findall(r'[a-z0-9]+', text.lower())
-        if not text_tokens or not tokens:
-            return 0.0
-        
-        matches = sum(1 for token in tokens if any(token in text_token or text_token in token for text_token in text_tokens))
-        return matches / len(tokens)
-    
     def humanize_machine_identifier(self, machine_id: str) -> str:
+        """Convert machine identifier to human-readable format"""
         if not machine_id:
             return ""
         
@@ -733,71 +576,8 @@ class RuleBasedCpeProcessor:
         
         return humanized
     
-    def validate_rule_based_extraction(self, vendor_human: str, product_human: str, 
-                                     vendor_machine: str, product_machine: str, title: str) -> Dict:
-        issues = []
-        confidence = 1.0
-        
-        if not vendor_human or not product_human:
-            return {'is_valid': False, 'issues': ['Missing vendor or product'], 'confidence': 0.0}
-        
-        vh_clean = re.sub(r'[^a-z0-9]', '', vendor_human.lower())
-        vm_clean = re.sub(r'[^a-z0-9]', '', vendor_machine.lower())
-        ph_clean = re.sub(r'[^a-z0-9]', '', product_human.lower())
-        pm_clean = re.sub(r'[^a-z0-9]', '', product_machine.lower())
-        
-        if vh_clean and vm_clean:
-            if len(vh_clean) > 0 and len(vm_clean) > 0 and vh_clean[0] != vm_clean[0]:
-                issues.append("Vendor start character mismatch")
-                confidence -= 0.2
-            if len(vh_clean) > 0 and len(vm_clean) > 0 and vh_clean[-1] != vm_clean[-1]:
-                issues.append("Vendor end character mismatch")
-                confidence -= 0.2
-        
-        if ph_clean and pm_clean:
-            if len(ph_clean) > 0 and len(pm_clean) > 0 and ph_clean[0] != pm_clean[0]:
-                issues.append("Product start character mismatch")
-                confidence -= 0.2
-            if len(ph_clean) > 0 and len(pm_clean) > 0 and ph_clean[-1] != pm_clean[-1]:
-                issues.append("Product end character mismatch")
-                confidence -= 0.2
-        
-        vendor_similarity = self.jaro_winkler_similarity(vendor_human.lower(), vendor_machine.lower())
-        product_similarity = self.jaro_winkler_similarity(product_human.lower(), product_machine.lower())
-        
-        if vendor_similarity < 0.7:
-            issues.append(f"Low vendor similarity: {vendor_similarity:.2f}")
-            confidence -= 0.3
-        
-        if product_similarity < 0.7:
-            issues.append(f"Low product similarity: {product_similarity:.2f}")
-            confidence -= 0.3
-        
-        reconstructed = f"{vendor_human} {product_human}".strip()
-        if reconstructed.lower() not in title.lower():
-            issues.append("Reconstruction not found in title")
-            confidence -= 0.2
-        
-        vendor_pos = title.lower().find(vendor_human.lower())
-        if vendor_pos >= 0:
-            after_vendor = title[vendor_pos + len(vendor_human):]
-            if after_vendor and product_human.lower() in after_vendor.lower():
-                product_pos = after_vendor.lower().find(product_human.lower())
-                if product_pos > 0 and not after_vendor[product_pos-1].isspace():
-                    issues.append("Product doesn't start after space")
-                    confidence -= 0.3
-        
-        is_valid = len(issues) <= 2 and confidence >= 0.4
-        
-        return {
-            'is_valid': is_valid,
-            'issues': issues,
-            'confidence': max(0.0, confidence),
-            'vendor_similarity': vendor_similarity,
-            'product_similarity': product_similarity
-        }
-    
     def jaro_winkler_similarity(self, s1: str, s2: str) -> float:
+        """Calculate Jaro-Winkler similarity between two strings"""
         if not s1 or not s2:
             return 0.0
         if s1 == s2:
@@ -810,7 +590,6 @@ class RuleBasedCpeProcessor:
         match1 = [False] * len1
         match2 = [False] * len2
         matches = 0
-        transpositions = 0
         
         for i in range(len1):
             start = max(0, i - max_dist)
@@ -826,6 +605,7 @@ class RuleBasedCpeProcessor:
         if matches == 0:
             return 0.0
         
+        transpositions = 0
         k = 0
         for i in range(len1):
             if not match1[i]:
@@ -848,6 +628,7 @@ class RuleBasedCpeProcessor:
         return jaro + 0.1 * prefix * (1 - jaro)
     
     def process_exceptions_with_ai(self, exceptions: List[Dict]) -> List[Dict]:
+        """Process exceptions using AI correction"""
         final_items = []
         
         for exception in exceptions:
@@ -869,8 +650,9 @@ class RuleBasedCpeProcessor:
                 product_human = ai_result.get('product_name', '').strip()
                 
                 if vendor_human and product_human:
-                    validation_result = self.validate_rule_based_extraction(
-                        vendor_human, product_human, vendor_machine, product_machine, items[0]['title']
+                    validation_result = self.validate_extraction_requirements(
+                        vendor_human, product_human, vendor_machine, product_machine, 
+                        items[0]['title'], [items[0]['title']]
                     )
                     
                     final_item = self.create_final_item(
@@ -879,7 +661,6 @@ class RuleBasedCpeProcessor:
                         validation_result=validation_result
                     )
                     final_items.append(final_item)
-                    logger.debug(f"AI corrected: {vendor_human} | {product_human}")
                 else:
                     final_item = self.create_final_item(
                         items, exception['rule_vendor'], exception['rule_product'],
@@ -904,7 +685,7 @@ class RuleBasedCpeProcessor:
     def create_final_item(self, items: List[Dict], vendor_human: str, product_human: str,
                          vendor_machine: str, product_machine: str, extraction_method: str,
                          confidence: float, validation_result: Dict) -> Dict:
-        
+        """Create final output item"""
         all_cpes = [item['cpe'] for item in items]
         all_versions = list(set(item['version'] for item in items if item['version'] != "-"))
         all_references = []
@@ -940,6 +721,7 @@ class RuleBasedCpeProcessor:
         }
     
     def parse_single_item(self, cpe_item: ET.Element) -> Optional[Dict]:
+        """Parse a single CPE item from XML"""
         try:
             cpe_22_uri = cpe_item.get("name", "") or ""
             cpe_23_element = cpe_item.find(".//cpe-23:cpe23-item", self.namespaces)
@@ -982,6 +764,7 @@ class RuleBasedCpeProcessor:
             return None
     
     def get_category_from_part(self, part: Part) -> str:
+        """Get category from CPE part"""
         if part == Part.APPLICATION:
             return "Application"
         elif part == Part.OPERATING_SYSTEM:
@@ -992,6 +775,7 @@ class RuleBasedCpeProcessor:
             return "Unknown"
     
     def get_corrected_category(self, part: Part, product_machine: str, title: str) -> str:
+        """Get corrected category for hardware/firmware detection"""
         base_category = self.get_category_from_part(part)
         
         if part == Part.OPERATING_SYSTEM and self.should_be_hardware_firmware(product_machine, title):
@@ -1000,6 +784,7 @@ class RuleBasedCpeProcessor:
         return base_category
     
     def should_be_hardware_firmware(self, product_machine: str, title: str) -> bool:
+        """Determine if OS should be categorized as Hardware/Firmware"""
         firmware_indicators = [
             "firmware", "bios", "uefi", "bootloader", "microcode",
             "driver", "embedded", "controller", "device"
@@ -1021,6 +806,7 @@ class RuleBasedCpeProcessor:
         return has_firmware or has_hardware
     
     def create_excel_file(self, data: List[Dict], output_file: str):
+        """Create Excel output file"""
         logger.info(f"Creating Excel file: {output_file}")
         columns = [
             "cpe", "Title", "vendor_human", "product_human", "Validation Product Name",
@@ -1051,6 +837,7 @@ class RuleBasedCpeProcessor:
         logger.info(f"AI-corrected exceptions: {ai_corrected_count}")
     
     def run(self, output_file: str):
+        """Main execution method"""
         logger.info("Starting RULE-BASED CPE processing (AI only for exceptions)")
         if not Path(self.xml_file_path).exists():
             raise FileNotFoundError(f"XML file not found: {self.xml_file_path}")
@@ -1063,4 +850,5 @@ class RuleBasedCpeProcessor:
         self.create_excel_file(cpe_data, output_file)
         logger.info("CPE processing completed successfully")
 
+# Maintain backward compatibility
 UnifiedCpeProcessor = RuleBasedCpeProcessor
