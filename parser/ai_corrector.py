@@ -31,52 +31,21 @@ class OpenAICorrector:
                 "part": item.get('part', 'a')
             })
         
-        system_prompt = """You are a CPE expert processing 1.4M+ records. Extract vendor/product names with PERFECT machine identifier alignment.
+        system_prompt = """You are a CPE expert processing vendor/product name extraction. Extract clean, human-readable names that align with machine identifiers.
 
-CRITICAL ALIGNMENT RULES:
-1. EXACT CHARACTER MAPPING:
-   - "fahadmahmood8" → "Fahadmahmood8" (preserve ALL characters including numbers)
-   - "sphider-plus" → "Sphider-plus" (preserve hyphens and exact casing)  
-   - "yaml-rust_project" → "Yaml-rust Project" (hyphens stay, underscores→spaces)
-   - "hyper" → "Hyper" (capitalize but maintain length)
+CRITICAL RULES:
+1. Extract vendor and product names from the TITLE
+2. Vendor and product names must start and end with same characters as machine identifiers (case-insensitive)
+3. Remove version numbers, edition info, and target platform info from product names
+4. Product names should not include "for WordPress", "for Windows", etc.
+5. Preserve proper capitalization and spacing
 
-2. MANDATORY VALIDATION ALIGNMENT:
-   - vendor_human[0].lower() MUST equal vendor_machine[0]
-   - vendor_human[-1].lower() MUST equal vendor_machine[-1]
-   - Same for products - THIS IS CRITICAL
+OUTPUT: JSON array [{"id": int, "vendor_name": "string", "product_name": "string"}]"""
 
-3. INTELLIGENT VENDOR=PRODUCT HANDLING:
-   When machines are identical ("hyper"/"hyper"):
-   - Check title context for differentiation clues
-   - Add minimal suffix that maintains end-character alignment
-   - "hyper 0.12.34" → vendor="Hyper", product="Hyper HTTP" (both end with 'r')
-   - "sphider-plus sphider-plus" → vendor="Sphider-plus", product="Sphider-plus Search" (both end with 's')
-
-4. CONTEXT-AWARE SUFFIXES (only if alignment preserved):
-   - HTTP libraries: "HTTP", "Client"  
-   - Search tools: "Search", "Engine"
-   - Frameworks: "Framework", "Library"
-   - Platforms: "Platform", "System"
-   - Only add if final character still aligns with machine
-
-5. SMART EXAMPLES:
-   - "Fahad Mahmood..." + machine="fahadmahmood8" → "Fahadmahmood8" (keep number for alignment)
-   - "Sphider-plus Sphider-plus 1.0" + machines="sphider-plus"/"sphider-plus" → "Sphider-plus"/"Sphider-plus" (same since machines identical)
-   - "hyper 0.12.34 for Rust" + machines="hyper"/"hyper" → "Hyper"/"Hyper" (simple case)
-   - "Apache Software Foundation RocketMQ" + machines="apache"/"rocketmq" → "Apache"/"Rocketmq"
-
-6. FALLBACK STRATEGY:
-   - If unsure about suffix, keep vendor=product identical
-   - Perfect alignment > differentiation
-   - Never break character validation for naming
-
-OUTPUT: JSON array [{"id": int, "vendor_name": "string", "product_name": "string"}]
-GUARANTEE: 100% character alignment validation success."""
-
-        user_content = f"Extract vendor and product names from these CPE entries according to standards:\n\n{json.dumps(batch_input, indent=2)}"
+        user_content = f"Extract vendor and product names from these CPE entries:\n\n{json.dumps(batch_input, indent=2)}"
         
         payload = {
-            "model": "gpt-5",
+            "model": "gpt-4o-mini",
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}

@@ -1,7 +1,7 @@
 import os
 import logging
 from dotenv import load_dotenv
-from parser.cpe_processor import UnifiedCpeProcessor
+from parser.cpe_processor import RuleBasedCpeProcessor
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -12,7 +12,7 @@ def main():
     OUTPUT_FILE = os.getenv("CPE_OUTPUT_PATH")
     
     try:
-        processor = UnifiedCpeProcessor(xml_file_path=XML_FILE_PATH, sample_percentage=SAMPLE_PERCENTAGE)
+        processor = RuleBasedCpeProcessor(xml_file_path=XML_FILE_PATH, sample_percentage=SAMPLE_PERCENTAGE)
         processor.run(OUTPUT_FILE)
         print("Processing completed successfully!")
         print(f"Output: {OUTPUT_FILE}")
